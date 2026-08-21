@@ -34,7 +34,14 @@ __rootcmd__ = True
     " jail to the RELEASE given.")
 @click.argument("jail", required=True)
 @click.option("--release", "-r", required=False, help="RELEASE to upgrade to")
-def cli(jail, release):
+@click.option(
+    "--basejail", "-b", "to_basejail", is_flag=True, default=False,
+    help="Convert a clone or thick jail to a basejail of the RELEASE, then"
+    " upgrade it the way basejails are upgraded, without freebsd-update."
+    " The jail must be stopped. A snapshot is taken first and the jail is"
+    " rolled back to it if the upgrade fails. Not accepted with ALL.")
+def cli(jail, release, to_basejail):
     """Runs upgrade with the command given inside the specified jail."""
     skip_jails = bool(jail != 'ALL')
-    ioc.IOCage(jail=jail, skip_jails=skip_jails).upgrade(release)
+    ioc.IOCage(jail=jail, skip_jails=skip_jails).upgrade(
+        release, to_basejail=to_basejail)

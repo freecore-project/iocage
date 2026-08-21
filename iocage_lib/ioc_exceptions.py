@@ -31,7 +31,7 @@ class ExceptionWithMsg(Exception):
     def __init__(self, message):
         if not isinstance(message, str) and not isinstance(
             message,
-            collections.Iterable
+            collections.abc.Iterable
         ):
             message = [message]
 
@@ -68,6 +68,10 @@ class JailMissingConfiguration(JailMisconfigured):
 
 
 class ValidationFailed(ExceptionWithMsg):
+    pass
+
+
+class PluginOperationRetired(ExceptionWithMsg):
     pass
 
 

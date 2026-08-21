@@ -6,8 +6,57 @@ import iocage_lib.dataset as dataset
 
 from iocage_lib.cache import cache
 from iocage_lib.resource import IocageListableResource
-from iocage_lib.ioc_fetch import IOCFetch
-from iocage_lib.ioc_common import check_release_newer
+from iocage_lib.ioc_fetch import (
+    IOCFetch, FREEBSD_ARCHIVE_SERVER, FREEBSD_ARCHIVE_ROOT,
+    archived_release_candidates, release_major,
+)
+from iocage_lib.ioc_common import (
+    check_release_newer, get_host_release, sort_release,
+)
+
+
+def remote_release_index(url, required=True):
+    """The ``XX.Y-RELEASE`` names a FreeBSD mirror index page lists.
+
+    A mirror that cannot be read is an error with a message when required,
+    and simply an empty list otherwise.
+    """
+    try:
+        req = requests.get(url, timeout=10)
+    except requests.RequestException as error:
+        if required:
+            raise RuntimeError(
+                f'Could not list releases from {url}: {error}'
+            ) from error
+        return []
+    if req.status_code != requests.codes.ok:
+        if required:
+            raise RuntimeError(
+                f'Could not list releases from {url}: '
+                f'HTTP {req.status_code}'
+            )
+        return []
+    return re.findall(
+        r'href="(\d[^"/]*RELEASE)/"', req.content.decode('utf-8')
+    )
+
+
+def remote_releases(machine, host_release):
+    """Primary-mirror releases plus the archived ones it no longer lists."""
+    primary = remote_release_index(
+        f'https://download.freebsd.org/ftp/releases/{machine}/'
+    )
+    host_major = release_major(host_release)
+    if host_major is None:
+        return primary
+    archived = remote_release_index(
+        f'https://{FREEBSD_ARCHIVE_SERVER}/{FREEBSD_ARCHIVE_ROOT}/'
+        f'{machine}/', required=False
+    )
+    return sort_release(
+        primary + archived_release_candidates(primary, archived, host_major),
+        fetch_releases=True,
+    )
 
 
 class Release(dataset.Dataset):
@@ -49,22 +98,13 @@ class ListableReleases(IocageListableResource):
     def __iter__(self):
         if self.remote:
             # TODO: Please abstract this in the future
-            req = requests.get(
-                'https://download.freebsd.org/ftp/'
-                f'releases/{os.uname().machine}/', timeout=10
-            )
-
-            assert req.status_code == 200
-
             for release in filter(
                 lambda r: (
                     r if not self.eol_check else r not in self.eol_list
                 ) and not check_release_newer(
                     r, raise_error=False, major_only=True
                 ),
-                re.findall(
-                    r'href="(\d.*RELEASE)/"', req.content.decode('utf-8')
-                )
+                remote_releases(os.uname().machine, get_host_release())
             ):
                 yield self.resource(release)
         else:

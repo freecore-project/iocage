@@ -27,6 +27,7 @@ import fileinput
 import hashlib
 import os
 import pathlib
+import stat
 import subprocess as su
 import tempfile
 import urllib.request
@@ -79,12 +80,20 @@ class IOCUpgrade:
             'HOME': '/',
             'TERM': 'xterm-256color'
         }
+        if os.environ.get('http_proxy', '') != '':
+            http_proxy_var = 'http_proxy'
+        else:
+            http_proxy_var = 'HTTP_PROXY'
+        for envvar in [http_proxy_var, 'HTTPS_PROXY', 'HTTP_PROXY_AUTH', 'NO_PROXY']:
+            if os.environ.get(envvar, '') != '':
+                self.upgrade_env[envvar] = os.environ.get(envvar)
 
         self.callback = callback
 
         # symbolic link created on fetch by freebsd-update
         bd_hash = hashlib.sha256((self.path + '\n').encode('utf-8')).hexdigest()
-        self.freebsd_install_link = os.path.join(self.path,
+        self.freebsd_install_link = os.path.join(
+            self.path,
             'var/db/freebsd-update', bd_hash + '-install')
 
     def upgrade_jail(self):
@@ -100,23 +109,29 @@ class IOCUpgrade:
 
         self.__upgrade_check_conf__()
 
-        f_rel = f'{self.new_release.rsplit("-RELEASE")[0]}.0'
-        f = 'https://raw.githubusercontent.com/freebsd/freebsd' \
-            f'/release/{f_rel}/usr.sbin/freebsd-update/freebsd-update.sh'
+        f_rel = f'{self.new_release.rsplit("-RELEASE")[0]}'
 
         tmp = None
         try:
-            tmp = tempfile.NamedTemporaryFile(delete=False)
-            with urllib.request.urlopen(f) as fbsd_update:
-                tmp.write(fbsd_update.read())
-            tmp.close()
-            os.chmod(tmp.name, 0o755)
+            fetched_update = f"{self.iocroot}/releases/{self.new_release}" \
+                f"/root/usr/sbin/freebsd-update"
+            if os.path.isfile(fetched_update):
+                fbsd_update = fetched_update
+            else:
+                f = "https://cgit.freebsd.org/src/plain" \
+                    f"/usr.sbin/freebsd-update/freebsd-update.sh?h=releng/{f_rel}"
+                tmp = tempfile.NamedTemporaryFile(delete=False)
+                with urllib.request.urlopen(f) as http:
+                    tmp.write(http.read())
+                tmp.close()
+                os.chmod(tmp.name, 0o755)
+                fbsd_update = tmp.name
 
             fetch_cmd = [
-                tmp.name, "-b", self.path, "-d",
+                fbsd_update, "-b", self.path, "-d",
                 f"{self.path}/var/db/freebsd-update/", "-f",
                 f"{self.path}/etc/freebsd-update.conf",
-                "--not-running-from-cron", "--currently-running "
+                "--not-running-from-cron", "--currently-running",
                 f"{self.jail_release}", "-r", self.new_release, "upgrade"
             ]
 
@@ -154,14 +169,14 @@ class IOCUpgrade:
                     silent=self.silent
                 )
 
-            for _ in range(50): # up to 50 invocations to prevent runaway
+            for _ in range(50):     # up to 50 invocations to prevent runaway
                 if os.path.islink(self.freebsd_install_link):
-                    self.__upgrade_install__(tmp.name)
+                    self.__upgrade_install__(fbsd_update)
                 else:
                     break
 
             if os.path.islink(self.freebsd_install_link):
-                msg = f'Upgrade failed, freebsd-update won\'t finish!'
+                msg = 'Upgrade failed, freebsd-update won\'t finish!'
                 iocage_lib.ioc_common.logit(
                     {
                         'level': 'EXCEPTION',
@@ -175,24 +190,6 @@ class IOCUpgrade:
                 self.path,
                 self.new_release
             )
-
-            if f_rel.startswith('12'):
-                #  https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=239498
-                cp = su.Popen(
-                    ['pkg-static', '-j', self.jid, 'install', '-q', '-f', '-y', 'pkg'],
-                    stdout=su.PIPE, stderr=su.PIPE
-                )
-                _, stderr = cp.communicate()
-                if cp.returncode:
-                    # Let's make this non-fatal as this is only being done as a convenience to user
-                    iocage_lib.ioc_common.logit(
-                        {
-                            'level': 'ERROR',
-                            'message': 'Unable to install pkg after upgrade'
-                        },
-                        _callback=self.callback,
-                        silent=self.silent,
-                    )
 
         finally:
             if tmp:
@@ -235,24 +232,44 @@ class IOCUpgrade:
         if snapshot:
             self.__snapshot_jail__()
 
-        p = pathlib.Path(
-            f"{self.iocroot}/releases/{self.new_release}/root/usr/src")
-        p_files = []
+        # Prefer the etc reference tree that base.txz already ships at
+        # releases/<rel>/root/var/db/etcupdate/current, applied with
+        # "etcupdate -t". Running the jail's own (older) etcupdate against a
+        # newer /usr/src breaks on a 13.x -> 15.x jump: FreeBSD 15 stages
+        # lib/libc's nsswitch.conf through ${.OBJDIR}, while a 13.x etcupdate
+        # only pre-creates obj dirs for etc/, so bmake writes into the
+        # read-only src nullfs mount and the whole upgrade aborts. The
+        # reference tree needs no compiler, no obj dirs and no src.txz.
+        reference_tree = pathlib.Path(
+            f"{self.iocroot}/releases/{self.new_release}"
+            "/root/var/db/etcupdate/current"
+        )
+        use_reference_tree = (
+            reference_tree.is_dir() and any(reference_tree.iterdir())
+        )
 
-        if p.exists():
-            for f in p.iterdir():
-                # We want to make sure files actually exist as well
-                p_files.append(f)
+        if not use_reference_tree:
+            # Older releases predate the shipped reference tree; fall back to
+            # building it from source, which is what requires src.txz.
+            p = pathlib.Path(
+                f"{self.iocroot}/releases/{self.new_release}/root/usr/src")
+            p_files = []
 
-        if not p_files:
-            msg = f"{self.new_release} is missing 'src.txz', please refetch!"
-            iocage_lib.ioc_common.logit(
-                {
-                    "level": "EXCEPTION",
-                    "message": msg
-                },
-                _callback=self.callback,
-                silent=self.silent)
+            if p.exists():
+                for f in p.iterdir():
+                    # We want to make sure files actually exist as well
+                    p_files.append(f)
+
+            if not p_files:
+                msg = f"{self.new_release} is missing 'src.txz', please" \
+                    " refetch!"
+                iocage_lib.ioc_common.logit(
+                    {
+                        "level": "EXCEPTION",
+                        "message": msg
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
 
         self.__upgrade_replace_basejail_paths__()
         ioc_up_dir = pathlib.Path(f"{self.path}/iocage_upgrade")
@@ -260,34 +277,68 @@ class IOCUpgrade:
         if not ioc_up_dir.exists():
             ioc_up_dir.mkdir(exist_ok=True, parents=True)
 
-        mount_cmd = [
-            "mount_nullfs", "-o", "ro",
-            f"{self.iocroot}/releases/{self.new_release}/root/usr/src",
-            f"{self.path}/iocage_upgrade"
-        ]
-        try:
-            iocage_lib.ioc_exec.SilentExec(
-                mount_cmd,
-                self.path.replace('/root', ''),
-                uuid=self.uuid,
-                unjailed=True
-            )
-        except iocage_lib.ioc_exceptions.CommandFailed:
-            msg = "Mounting src into jail failed! Rolling back snapshot."
-            self.__rollback_jail__(name=snap_name)
+        if use_reference_tree:
+            # Stage the tarball inside the jail so jexec'd etcupdate can read
+            # it; -C keeps ownership/modes exactly as the release ships them.
+            tarball = f"{self.path}/iocage_upgrade/etcupdate-reference.tar"
+            tar_cmd = [
+                "tar", "-cf", tarball, "-C", str(reference_tree), "."
+            ]
+            try:
+                iocage_lib.ioc_exec.SilentExec(
+                    tar_cmd,
+                    self.path.replace('/root', ''),
+                    uuid=self.uuid,
+                    unjailed=True
+                )
+            except iocage_lib.ioc_exceptions.CommandFailed:
+                msg = "Preparing the etcupdate reference tree failed!" \
+                    " Rolling back snapshot."
+                self.__rollback_jail__(name=snap_name)
 
-            iocage_lib.ioc_common.logit(
-                {
-                    "level": "EXCEPTION",
-                    "message": msg
-                },
-                _callback=self.callback,
-                silent=self.silent)
+                iocage_lib.ioc_common.logit(
+                    {
+                        "level": "EXCEPTION",
+                        "message": msg
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
 
-        etcupdate_cmd = [
-            "/usr/sbin/jexec", f"ioc-{self.uuid.replace('.', '_')}",
-            "/usr/sbin/etcupdate", "-F", "-s", "/iocage_upgrade"
-        ]
+            etcupdate_cmd = [
+                "/usr/sbin/jexec", f"ioc-{self.uuid.replace('.', '_')}",
+                "/usr/sbin/etcupdate", "-F", "-t",
+                "/iocage_upgrade/etcupdate-reference.tar"
+            ]
+        else:
+            mount_cmd = [
+                "mount_nullfs", "-o", "ro",
+                f"{self.iocroot}/releases/{self.new_release}/root/usr/src",
+                f"{self.path}/iocage_upgrade"
+            ]
+            try:
+                iocage_lib.ioc_exec.SilentExec(
+                    mount_cmd,
+                    self.path.replace('/root', ''),
+                    uuid=self.uuid,
+                    unjailed=True
+                )
+            except iocage_lib.ioc_exceptions.CommandFailed:
+                msg = "Mounting src into jail failed! Rolling back snapshot."
+                self.__rollback_jail__(name=snap_name)
+
+                iocage_lib.ioc_common.logit(
+                    {
+                        "level": "EXCEPTION",
+                        "message": msg
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
+
+            etcupdate_cmd = [
+                "/usr/sbin/jexec", f"ioc-{self.uuid.replace('.', '_')}",
+                "/usr/sbin/etcupdate", "-F", "-s", "/iocage_upgrade"
+            ]
+
         try:
             iocage_lib.ioc_exec.SilentExec(
                 etcupdate_cmd,
@@ -299,11 +350,28 @@ class IOCUpgrade:
             # These are now the result of a failed merge, nuking and putting
             # the backup back
             msg = "etcupdate failed! Rolling back snapshot."
+
+            # etcupdate's own reason only reaches its logfile, so surface the
+            # tail of it instead of leaving the user with a bare failure.
+            etcupdate_log = pathlib.Path(f"{self.path}/var/db/etcupdate/log")
+            if etcupdate_log.is_file():
+                try:
+                    tail = etcupdate_log.read_text(
+                        errors="replace"
+                    ).splitlines()[-10:]
+                except OSError:
+                    tail = []
+                if tail:
+                    msg += "\netcupdate log:\n" + "\n".join(tail)
+
             self.__rollback_jail__(name=snap_name)
 
-            su.Popen([
-                "umount", "-f", f"{self.path}/iocage_upgrade"
-            ]).communicate()
+            if use_reference_tree:
+                su.Popen(["rm", "-f", tarball]).communicate()
+            else:
+                su.Popen([
+                    "umount", "-f", f"{self.path}/iocage_upgrade"
+                ]).communicate()
 
             iocage_lib.ioc_common.logit(
                 {
@@ -333,17 +401,224 @@ class IOCUpgrade:
             uuid=self.uuid
         )
 
-        umount_command = [
-            "umount", "-f", f"{self.path}/iocage_upgrade"
-        ]
+        if use_reference_tree:
+            cleanup_command = ["rm", "-f", tarball]
+        else:
+            cleanup_command = [
+                "umount", "-f", f"{self.path}/iocage_upgrade"
+            ]
         iocage_lib.ioc_exec.SilentExec(
-            umount_command,
+            cleanup_command,
             self.path.replace('/root', ''),
             uuid=self.uuid,
             unjailed=True
         )
 
         return new_release
+
+    def upgrade_to_basejail(self):
+        """
+        Turns a stopped clone or thick jail into a basejail of the new
+        RELEASE and upgrades it the way a basejail is upgraded, so no
+        freebsd-update run is needed.
+
+        Everything that can be refused is checked before the jail is touched.
+        A snapshot is taken next, and the jail is rolled back to it when a
+        later step fails, so a failed run leaves the jail as it was.
+        """
+        if "HBSD" in self.freebsd_version:
+            self.__refuse__(
+                "Converting a jail to a basejail on HardenedBSD is not"
+                " supported yet."
+            )
+
+        basedirs = iocage_lib.ioc_common.basejail_dirs(self.new_release)
+        snap_name = f"ioc_upgrade_{self.date}"
+        self.__check_basejail_conversion__(basedirs, snap_name)
+        self.__snapshot_jail__()
+
+        try:
+            self.__convert_to_basejail__(basedirs)
+
+            import iocage_lib.ioc_start as ioc_start  # Avoids dep issues
+            ioc_start.IOCStart(
+                self.uuid, self.path.rsplit('/root', 1)[0], silent=True
+            )
+
+            new_release = self.upgrade_basejail(
+                snapshot=False, snap_name=snap_name
+            )
+        except BaseException:
+            # Also SystemExit, which is what a failed step raises on the
+            # command line, and an interrupt from the keyboard.
+            try:
+                self.__undo_basejail_conversion__(basedirs, snap_name)
+            except BaseException as e:
+                msg = f"Rolling {self.uuid} back failed: {e}\n" \
+                    f"The jail as it was is in the snapshot {snap_name}." \
+                    f" Stop it and run: iocage rollback -n {snap_name}" \
+                    f" {self.uuid}"
+            else:
+                msg = f"{self.uuid} was rolled back to the snapshot" \
+                    f" {snap_name}. It is not a basejail and was not" \
+                    " upgraded."
+
+            iocage_lib.ioc_common.logit(
+                {
+                    "level": "ERROR",
+                    "message": msg
+                },
+                _callback=self.callback,
+                silent=self.silent)
+
+            raise
+
+        return new_release
+
+    def __refuse__(self, msg):
+        iocage_lib.ioc_common.logit(
+            {
+                "level": "EXCEPTION",
+                "message": msg
+            },
+            _callback=self.callback,
+            silent=self.silent)
+
+    def __check_basejail_conversion__(self, basedirs, snap_name):
+        """Refuses a conversion that cannot work. Changes nothing."""
+        import iocage_lib.ioc_fstab as ioc_fstab  # Avoids dep issues
+        from iocage_lib.snapshot import Snapshot
+
+        release_root = pathlib.Path(
+            f"{self.iocroot}/releases/{self.new_release}/root")
+
+        if not release_root.is_dir():
+            self.__refuse__(f"{self.new_release} is missing, please fetch it!")
+
+        missing = [d for d in basedirs if not (release_root / d).is_dir()]
+
+        if missing:
+            self.__refuse__(
+                f"{self.new_release} has no {', '.join(missing)}, please"
+                " refetch it!"
+            )
+
+        # etcupdate merges the jail's /etc against the tree the jail's own
+        # RELEASE shipped. Without it there is nothing to merge against.
+        reference = pathlib.Path(f"{self.path}/var/db/etcupdate/current")
+
+        if not reference.is_dir() or not any(reference.iterdir()):
+            self.__refuse__(
+                f"{self.uuid} has no /var/db/etcupdate/current, so its /etc"
+                f" cannot be merged with {self.new_release}. Upgrade it"
+                " without --basejail."
+            )
+
+        # The directories are emptied below. A link on the way to one of
+        # them would take that outside the jail.
+        for bdir in basedirs:
+            parts = bdir.split('/')
+            current = self.path
+
+            for depth, part in enumerate(parts, start=1):
+                current = os.path.join(current, part)
+
+                try:
+                    mode = os.lstat(current).st_mode
+                except FileNotFoundError:
+                    if depth == len(parts):
+                        break
+
+                    self.__refuse__(
+                        f"{current} does not exist, {self.uuid} cannot be"
+                        " converted to a basejail."
+                    )
+
+                if not stat.S_ISDIR(mode):
+                    self.__refuse__(
+                        f"{current} is not a directory, {self.uuid} cannot"
+                        " be converted to a basejail."
+                    )
+
+        # A mount on, inside or above one of the directories would end up
+        # hidden by the RELEASE, or would hide it.
+        mounts = [f"{self.path}/{bdir}" for bdir in basedirs]
+
+        for _index, entry in ioc_fstab.IOCFstab(self.uuid, 'list').fstab_list():
+            if len(entry) < 2:
+                continue
+
+            destination = entry[1].rstrip('/')
+
+            for mount in mounts:
+                if destination == mount \
+                        or destination.startswith(f"{mount}/") \
+                        or mount.startswith(f"{destination}/"):
+                    self.__refuse__(
+                        f"The fstab of {self.uuid} mounts {destination}."
+                        f" A basejail mounts {mount} from the RELEASE."
+                        " Remove that fstab entry first."
+                    )
+
+        if Snapshot(
+            f"{self.pool}/iocage/jails/{self.uuid}@{snap_name}"
+        ).exists:
+            self.__refuse__(
+                f"The snapshot {snap_name} of {self.uuid} already exists."
+                " It would be the way back from this upgrade: remove or"
+                " rename it first."
+            )
+
+    def __convert_to_basejail__(self, basedirs):
+        """
+        Does to an existing jail what creating a basejail does to a new one:
+        empties the base directories, mounts them from the RELEASE and
+        records the jail as a basejail.
+        """
+        import iocage_lib.ioc_fstab as ioc_fstab  # Avoids dep issues
+
+        for bdir in basedirs:
+            source = f"{self.iocroot}/releases/{self.new_release}/root/{bdir}"
+            destination = f"{self.path}/{bdir}"
+
+            if os.path.lexists(destination):
+                # freebsd-update leaves system files immutable
+                su.run(
+                    ["chflags", "-R", "0", destination],
+                    stdout=su.DEVNULL, stderr=su.DEVNULL
+                )
+                su.run(
+                    ["rm", "-r", "-f", destination],
+                    stdout=su.DEVNULL, stderr=su.DEVNULL
+                )
+
+            if os.path.lexists(destination):
+                self.__refuse__(f"{destination} could not be emptied.")
+
+            os.mkdir(destination)
+
+            ioc_fstab.IOCFstab(
+                self.uuid, "add", source, destination, "nullfs", "ro", "0",
+                "0", silent=True
+            )
+
+        iocage_lib.ioc_json.IOCJson(
+            self.path.rsplit('/root', 1)[0],
+            silent=True).json_set_value("basejail=1")
+
+    def __undo_basejail_conversion__(self, basedirs, snap_name):
+        import iocage_lib.iocage as ioc  # Avoids dep issues
+        iocage = ioc.IOCage(jail=self.uuid, skip_jails=True, silent=True)
+        iocage.stop()
+
+        # A start that failed half way can leave the RELEASE mounted
+        for bdir in basedirs:
+            su.run(
+                ["umount", "-f", f"{self.path}/{bdir}"],
+                stdout=su.DEVNULL, stderr=su.DEVNULL
+            )
+
+        iocage.rollback(snap_name)
 
     def __upgrade_install__(self, name):
         """Installs the upgrade."""
@@ -379,11 +654,23 @@ class IOCUpgrade:
         Replaces freebsd-update.conf's default Components configuration to not
         update kernel
         """
-        f = f"{self.path}/etc/freebsd-update.conf"
         text = "Components src world kernel"
         replace = "Components src world"
 
-        self.__upgrade_replace_text__(f, text, replace)
+        # the internal development record: the file is the jail's. An in-place edit by path read a link
+        # there and wrote the linked host file's text into the jail.
+        if iocage_lib.ioc_common.replace_in_jail_etc_file(
+            self.path, 'freebsd-update.conf', text, replace
+        ) in ('absent', 'not-a-file'):
+            iocage_lib.ioc_common.logit(
+                {
+                    'level': 'EXCEPTION',
+                    'message': f'{self.path}/etc/freebsd-update.conf is not a'
+                               ' plain file; the jail is not upgraded.'
+                },
+                _callback=self.callback,
+                silent=self.silent
+            )
 
     def __upgrade_replace_basejail_paths__(self):
         f = f"{self.iocroot}/jails/{self.uuid}/fstab"
