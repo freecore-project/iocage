@@ -53,6 +53,12 @@ from iocage_lib.release import Release
 from iocage_lib.snapshot import SnapshotListableResource, Snapshot
 
 
+# Work around Click bugs and incompatible default-true flag behavior across
+# the dependency versions supported by this iocage line. When this workaround
+# is removed, its consumers should use flag_value=False with default=True.
+CLICK_WORKAROUND = True
+
+
 class PoolAndDataset:
 
     def get_pool(self):
@@ -994,6 +1000,15 @@ class IOCage:
         keep_jail_on_failure = kwargs.pop("keep_jail_on_failure", False)
         thick_config = kwargs.pop("thickconfig", False)
 
+        if plugins or plugin_name:
+            kwargs['git_repository'] = ioc_json.normalize_plugin_repository(
+                kwargs.get('git_repository')
+            )
+            if not _list:
+                ioc_json.validate_plugin_repository_for_creation(
+                    kwargs['git_repository'], self.callback, self.silent
+                )
+
         freebsd_version = ioc_common.checkoutput(["freebsd-version"])
         arch = os.uname()[4]
 
@@ -1037,8 +1052,12 @@ class IOCage:
             if plugins:
                 ioc_plugin.IOCPlugin(
                     release=release,
+                    jail=name,
                     plugin=plugin_name,
                     branch=branch,
+                    silent=self.silent,
+                    keep_jail_on_failure=keep_jail_on_failure,
+                    callback=self.callback,
                     thickconfig=thick_config,
                     **kwargs).fetch_plugin_index(
                         props, accept_license=accept, official=official)

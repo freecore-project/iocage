@@ -43,6 +43,31 @@ import iocage_lib.ioc_stop
 import iocage_lib.ioc_exceptions as ioc_exceptions
 
 
+def parse_dhcp_address(ifconfig_output):
+    return iocage_lib.ioc_common.parse_dhcp_address(ifconfig_output)
+
+
+def allow_dying_supported():
+    try:
+        return int(os.uname()[2].split(".", 1)[0]) < 15
+    except (IndexError, TypeError, ValueError):
+        return True
+
+
+def find_vnet_default_route_interface(nics, addresses):
+    defined_interfaces = [nic.split(':', 1)[0] for nic in nics]
+    specified_interfaces = [
+        'vnet0' if '|' not in addr else addr.split('|', 1)[0]
+        for addr in addresses.split(',')
+    ]
+
+    for interface in defined_interfaces:
+        if interface in specified_interfaces:
+            return interface
+
+    return 'vnet0'
+
+
 class IOCStart(object):
 
     """
@@ -577,7 +602,7 @@ class IOCStart(object):
                 f'exec.timeout={exec_timeout}',
                 f'stop.timeout={stop_timeout}',
                 f'mount.fstab={self.path}/fstab',
-                'allow.dying',
+                'allow.dying' if allow_dying_supported() else '',
                 f'exec.consolelog={self.iocroot}/log/ioc-'
                 f'{self.uuid}-console.log',
                 f'ip_hostname={ip_hostname}' if ip_hostname else '',
@@ -923,19 +948,13 @@ class IOCStart(object):
                        interface, 'inet']
                 out = su.check_output(cmd)
 
-                # ...so we extract the ip4 address and mask,
-                # and calculate cidr manually
-                addr_split = out.splitlines()[2].split()
-                self.ip4_addr = addr_split[1].decode()
-                hexmask = addr_split[3].decode()
-                maskcidr = sum([bin(int(hexmask, 16)).count('1')])
-
+                self.ip4_addr, maskcidr = parse_dhcp_address(out)
                 addr = f'{self.ip4_addr}/{maskcidr}'
 
                 if '0.0.0.0' in addr:
                     failed_dhcp = True
 
-            except (su.CalledProcessError, IndexError):
+            except (su.CalledProcessError, IndexError, ValueError):
                 failed_dhcp = True
                 addr = 'ERROR, check jail logs'
 
@@ -1110,19 +1129,10 @@ class IOCStart(object):
                     # when adding default route, the value of interface
                     # should be the default gateway of the jail. Let's
                     # correct that behavior.
-                    defined_interfaces = [i.split(':') for i in nics]
-                    specified_interfaces = [
-                        'vnet0' if '|' not in i else i.split('|')[0]
-                        for i in ip
-                    ]
                     # The default gateway here for the jail would be the
                     # one which is present first in "defined_interfaces"
                     # and also in "specified_interfaces".
-                    default_gw = 'vnet0'  # Defaulting to vnet0
-                    for i in defined_interfaces:
-                        if i in specified_interfaces:
-                            default_gw = i
-                            break
+                    default_gw = find_vnet_default_route_interface(nics, ip)
                     default_route = f'{default_route.split("%")[0]}' \
                         f'%{default_gw.replace("vnet", "epair")}b'
 
@@ -1183,7 +1193,8 @@ class IOCStart(object):
 
                 for addrs, gw, ipv6 in net_configs:
                     if (
-                        dhcp or 'DHCP' in self.ip4_addr.upper()
+                        not ipv6 and
+                        (dhcp or 'DHCP' in self.ip4_addr.upper())
                     ) and 'accept_rtadv' not in addrs:
                         # Spoofing IP address, it doesn't matter with DHCP
                         addrs = f"{nic}|''"
@@ -1305,6 +1316,14 @@ class IOCStart(object):
                 ],
                 stderr=su.STDOUT
             )
+            # FreeBSD 15 epair TX checksum offload can break NAT/VNET jail DNS.
+            iocage_lib.ioc_common.checkoutput(
+                [
+                    "setfib", self.exec_fib, "jexec", f"ioc-{self.uuid}",
+                    "ifconfig", jail_nic, "-txcsum", "-txcsum6"
+                ],
+                stderr=su.STDOUT
+            )
 
             if not nat_addr:
                 try:
@@ -1358,7 +1377,7 @@ class IOCStart(object):
             ifconfig = [iface, ip, 'alias']
 
         try:
-            if not wants_dhcp and ip != 'accept_rtadv':
+            if not (wants_dhcp and not ipv6) and ip != 'accept_rtadv':
                 # Jail side
                 iocage_lib.ioc_common.checkoutput(
                     ['setfib', self.exec_fib, 'jexec', f'ioc-{self.uuid}',
