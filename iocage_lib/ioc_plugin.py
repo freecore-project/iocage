@@ -26,7 +26,6 @@ import collections
 import concurrent.futures
 import contextlib
 import datetime
-import distutils.dir_util
 import json
 import logging
 import os
@@ -60,7 +59,7 @@ from iocage_lib.dataset import Dataset
 
 
 GIT_LOCK = threading.Lock()
-RE_PLUGIN_VERSION = re.compile(r'"path"\s*:\s*"([/\.\+,\d\w-]*)\.(?:\btxz\b|\bpkg\b)"')
+RE_PLUGIN_VERSION = re.compile(r'"path"\s*:\s*"([^"]*)\.(?:\btxz\b|\bpkg\b)"')
 
 # deliberately crash if tarfile doesn't have required filter
 tarfile.tar_filter
@@ -117,9 +116,9 @@ class IOCPlugin(object):
         # TODO: For a lack of ability to do this efficiently/correctly here,
         #  the above should be enforced by the caller of IOCPlugin
 
-        self.git_repository = kwargs.get(
-            'git_repository'
-        ) or 'https://github.com/freenas/iocage-ix-plugins.git'
+        self.git_repository = iocage_lib.ioc_json.normalize_plugin_repository(
+            kwargs.get('git_repository')
+        )
 
         self.git_destination = kwargs.get('git_destination')
         if not self.git_destination:
@@ -173,6 +172,7 @@ class IOCPlugin(object):
                             if not searched:
                                 continue
                             name = searched[0].rsplit('/', 1)[-1]
+                            name = name.split('~', 1)[0]
                             package_site_data[
                                 name.rsplit('-', 1)[0]
                             ] = iocage_lib.ioc_common.parse_package_name(name)
@@ -305,6 +305,10 @@ class IOCPlugin(object):
 
     def fetch_plugin(self, props, num, accept_license):
         """Helper to fetch plugins"""
+        iocage_lib.ioc_json.validate_plugin_repository_for_creation(
+            self.git_repository, self.callback, self.silent
+        )
+
         plugins = self.fetch_plugin_index(props, index_only=True)
         conf = self.retrieve_plugin_json()
         iocage_lib.ioc_common.validate_plugin_manifest(conf, self.callback, self.silent)
@@ -765,7 +769,7 @@ fingerprint: {fingerprint}
             if _conf['vnet']:
                 interface = _conf['interfaces'].split(',')[0].split(':')[0]
 
-                if interface == 'vnet0':
+                if 'vnet' in interface:
                     # Jails use epairNb by default inside
                     interface = f'{interface.replace("vnet", "epair")}b'
 
@@ -773,8 +777,8 @@ fingerprint: {fingerprint}
                     'jexec', f'ioc-{self.jail.replace(".", "_")}',
                     'ifconfig', interface, 'inet'
                 ]
-                out = su.check_output(ip4_cmd).decode()
-                ip = f'{out.splitlines()[2].split()[1]}'
+                out = su.check_output(ip4_cmd)
+                ip, _ = iocage_lib.ioc_common.parse_dhcp_address(out)
             else:
                 ip = json.loads(
                     su.run([
@@ -895,6 +899,11 @@ fingerprint: {fingerprint}
         self, props, _list=False, list_header=False, list_long=False,
         accept_license=False, icon=False, official=False, index_only=False
     ):
+        if not _list and not index_only:
+            iocage_lib.ioc_json.validate_plugin_repository_for_creation(
+                self.git_repository, self.callback, self.silent
+            )
+
         self.pull_clone_git_repo()
 
         index_path = os.path.join(self.git_destination, 'INDEX')
@@ -993,7 +1002,8 @@ fingerprint: {fingerprint}
         self.plugin = self.__fetch_validate_plugin__(
             self.plugin.lower(), plugins_ordered_dict
         )
-        self.jail = f'{self.plugin}_{str(uuid.uuid4())[:4]}'
+        if not self.jail:
+            self.jail = f'{self.plugin}_{str(uuid.uuid4())[:4]}'
 
         # We now run the fetch the user requested
         self.fetch_plugin(props, 0, accept_license)
@@ -1191,9 +1201,10 @@ fingerprint: {fingerprint}
                     silent=self.silent
                 )
 
-            distutils.dir_util.copy_tree(
+            shutil.copytree(
                 artifact_path,
-                os.path.join(path, 'plugin')
+                os.path.join(path, 'plugin'),
+                dirs_exist_ok=True
             )
         else:
             self._clone_repo(
@@ -1203,15 +1214,13 @@ fingerprint: {fingerprint}
 
         if os.path.isdir(f"{path}/plugin/overlay/"):
             try:
-                # Quickfix for distutils cache bug making re-installed
-                # plugins with same name fail to copy the overlay folder
-                distutils.dir_util._path_created = {}
-
-                distutils.dir_util.copy_tree(
+                shutil.copytree(
                     f"{path}/plugin/overlay/",
                     f"{path}/root",
-                    preserve_symlinks=True)
-            except distutils.errors.DistutilsFileError as e:
+                    symlinks=True,
+                    dirs_exist_ok=True
+                )
+            except shutil.Error as e:
                 # Copy tree should succeed if the overlay folder exists
                 iocage_lib.ioc_common.logit(
                     {
@@ -1225,12 +1234,16 @@ fingerprint: {fingerprint}
     def __update_pkg_remove__(self, jid):
         """Remove all pkgs from the plugin"""
         try:
+            # The jail package database can be newer than the host libpkg.
+            # Its static pkg stays usable while a base release is upgraded.
             with iocage_lib.ioc_exec.IOCExec(
-                command=['pkg', '-j', jid, 'delete', '-a', '-f', '-y'],
+                command=[
+                    '/usr/local/sbin/pkg-static',
+                    'delete', '-a', '-f', '-y'
+                ],
                 path=f'{self.iocroot}/jails/{self.jail}',
                 uuid=self.jail,
-                callback=self.callback,
-                unjailed=True
+                callback=self.callback
             ) as _exec:
                 iocage_lib.ioc_common.consume_and_log(
                     _exec,
