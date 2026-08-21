@@ -1,4 +1,4 @@
-.Dd October 25, 2019
+.Dd June 16, 2026
 .Dt IOCAGE 8
 .Os
 .Sh NAME
@@ -212,6 +212,9 @@
 .\" == UPDATE ==
 .Nm
 .Cm update
+.Op Fl s | -server
+.Op Fl NV | -noverify
+.Op Fl V | -verify
 .Ar UUID | NAME
 .\" == UPGRADE ==
 .Nm
@@ -301,7 +304,6 @@ By default, all other pools are deactivated.
 Example:
 .Pp
 .Dl # iocage activate examplezpool
-.Pp
 .\" == CHROOT ==
 .It Cm chroot
 Chroot into a jail without actually starting the jail itself.
@@ -341,7 +343,6 @@ Example:
 .Pp
 Destroys all created jails on the system, after a prompt ensures this
 is the desired action.
-.Pp
 .\"== CLONE ==
 .It Cm clone
 Clone a jail.
@@ -363,7 +364,6 @@ Clone jail 38114a58 and add the name cloneexample1 to the new jail.
 .Pp
 .Dl # iocage clone exampjail -c 3
 Creates three jail clones of exampjail.
-.Pp
 .\" == CONSOLE ==
 .It Cm console
 Execute login to open a shell inside the jail.
@@ -379,7 +379,6 @@ Examples:
 .Dl # iocage console cloneexample1
 .Pp
 .Dl # iocage console -f jail1
-.Pp
 .\" == CREATE ==
 .It Cm create
 Deploy a new jail based on the host operating system's RELEASE.
@@ -425,18 +424,23 @@ Specify a desired UUID for the new jail.
 .Pp
 Examples:
 .Pp
-.Dl # iocage create -s -r 11.0-RELEASE
+.Dl # iocage create -s -r 15.1-RELEASE
 .Pp
-Create a FreeBSD 11.0 jail with a shortened UUID.
+Create a
+.Fx
+15.1 jail with a shortened UUID.
 .Pp
-.Dl # iocage create -r 11.0-RELEASE -u 12345678
+.Dl # iocage create -r 15.1-RELEASE -u 12345678
 .Pp
-Create a FreeBSD 11.0 jail with the custom UUID 12345678.
+Create a
+.Fx
+15.1 jail with the custom UUID 12345678.
 .Pp
-.Dl # iocage create -c 3 -r 11.0-RELEASE -n examplejail
+.Dl # iocage create -c 3 -r 15.1-RELEASE -n examplejail
 .Pp
 This command creates three identical jails based off the
-FreeBSD 11.0 RELEASE.
+.Fx
+15.1 RELEASE.
 These jails are sequentially numbered  based on the
 custom NAME.
 .\" == DESTROY ==
@@ -467,10 +471,11 @@ Examples:
 .Pp
 Destroy the identified jail with no further input.
 .Pp
-.Dl # iocage destroy -r 10.1-RELEASE
+.Dl # iocage destroy -r 15.1-RELEASE
 .Pp
-Destroy the downloaded FreeBSD 10.1 release.
-.Pp
+Destroy the downloaded
+.Fx
+15.1 release.
 .\" == DF ==
 .It Cm df
 Show resource usage of all jails.
@@ -510,7 +515,6 @@ Example:
 .Dl # iocage df -l
 .Pp
 Displays the usage table with the full UUID of each jail.
-.Pp
 .\" == EXEC ==
 .It Cm exec
 Execute a command inside the specified jail.
@@ -522,14 +526,14 @@ After invoking
 .Cm exec ,
 specify the jail, any commands to run inside that jail, and any
 arguments for those commands.
-.Xr jexec
+.Xr jexec 8
 also runs commands similar to
 .Nm .
 When using
-.Xr jexec
+.Xr jexec 8
 use the JID instead of the jail name.
 For more info see the manual page for
-.Xr jexec .
+.Xr jexec 8 .
 Use -- in front of the specified command to prevent iocage from parsing
 them.
 .Pp
@@ -558,7 +562,6 @@ In this example, examplejail_1 executes
 while the output is run with
 .Cm less
 outside the jail on the primary system.
-.Pp
 .\" == EXPORT ==
 .It Cm export
 Exports the specified jail.
@@ -570,7 +573,6 @@ The jail must be stopped before exporting.
 Example:
 .Pp
 .Dl # iocage export examplejail_2
-.Pp
 .\" == FETCH ==
 .It Cm fetch
 Downloads and/or updates releases.
@@ -595,7 +597,7 @@ Fetch and create an official FreeNAS plugin.
 .It Op Fl E | -eol
 Enable End Of Life (EOL) checking upstream.
 .It Op Fl F | -files Ar TEXT
-Uses a local file directory for the root directory instead of HTTP.
+Specify the files to fetch from the mirror.
 .It Op Fl NE | -noeol
 Disable EOL checking upstream.
 .It Op Fl NU | -noupdate
@@ -644,27 +646,37 @@ Examples:
 .Dl # iocage fetch
 .Pp
 .Nm
-lists available FreeBSD releases and asks which to download.
+lists available
+.Fx
+releases and asks which to download.
 Enter the numeric option for the desired release, or type EXIT
 to quit without downloading.
 .Pp
-.Dl # iocage fetch --release 10.3-RELEASE
+.Dl # iocage fetch --release 14.4-RELEASE
 .Pp
 This tells
 .Nm
-to download and automatically update the FreeBSD 10.3 RELEASE.
+to download and automatically update the
+.Fx
+14.4 RELEASE.
 This can also be used to apply the latest patches to an already
 downloaded release.
 Newly created jails or basejails are automatically updated.
 .Pp
-.Dl # iocage fetch -NE -r 11.0-RELEASE
+.Dl # iocage fetch -NE -r 15.1-RELEASE
 .Pp
-This disables the end of life check, then fetches the FreeBSD 11.0
-release and updates with the latest patches.
+This disables the end of life check, then fetches the
+.Fx
+15.1 release and updates with the latest patches.
 .Pp
 .Dl # iocage fetch -r LATEST
 .Pp
 This fetches the latest release available.
+.Pp
+.Dl # iocage fetch -r 15.1-RELEASE -F base.txz -F lib32.txz
+.Pp
+This fetches only the base and lib32 distribution sets for
+15.1-RELEASE.
 .\" == FSTAB ==
 .It Cm fstab
 Manipulates the fstab settings of a specific jail.
@@ -695,8 +707,7 @@ and unmounts it.
 .Pp
 Example:
 .Pp
-.Dl # iocage fstab -e examplejail_1
-.Pp
+.Dl # iocage fstab -a example_jail_1 /usr/home /usr/home nullfs rw 0 0
 .\" == GET ==
 .It Cm get
 Display the specified property.
@@ -748,7 +759,6 @@ status of the requested property.
 .Dl # iocage get -s examplejail_1
 .Pp
 Return whether the state of the jail is up or down.
-.Pp
 .\" == IMPORT ==
 .It Cm import
 Import a specific jail image.
@@ -758,7 +768,6 @@ the UUID.
 Example:
 .Pp
 .Dl # iocage import 064c247
-.Pp
 .\" == LIST ==
 .It Cm list
 List the specified dataset type.
@@ -809,11 +818,12 @@ Can be up or down.
 .It NAME
 The user assigned NAME.
 .It RELEASE
-The jail's FreeBSD RELEASE.
+The jail's
+.Fx
+RELEASE.
 .It IP4
 Shows the availability of IP4 addresses.
 .El
-.Pp
 .\" == MIGRATE ==
 .It Cm migrate
 Migrate from the development version of iocage-legacy to the current
@@ -833,14 +843,12 @@ Example:
 .Pp
 Migrates to the new jail format and deletes the old dataset with
 no further user interaction.
-.Pp
 .\" == PKG ==
 .It Cm pkg
 Run desired
 .Cm pkg
 commands in the specified jail.
 List the jail's UUID or NAME, then any desired commands.
-.Pp
 .\" == RENAME ==
 .It Cm rename
 Rename the specified jail.
@@ -849,7 +857,6 @@ Examples:
 .Pp
 .Dl # iocage rename jail1 NEWNAME
 .Dl Jail: jail1 renamed to NEWNAME
-.Pp
 .\" == RESTART ==
 .It Cm restart
 Restart the specified jail, OR use ALL to restart all jails.
@@ -865,7 +872,6 @@ Examples:
 .Dl # iocage restart ALL
 .Pp
 .Dl # iocage restart --soft examplejail1
-.Pp
 .\" == ROLLBACK ==
 .It Cm rollback
 Roll back a jail to an existing snapshot.
@@ -884,7 +890,6 @@ Run the command, skipping any warnings or further user interaction.
 Example:
 .Pp
 .Dl # iocage rollback -n snapshottest2 examplejail1
-.Pp
 .\" == SET ==
 .It Cm set
 Set the specified properties in the desired jail.
@@ -901,7 +906,6 @@ If accessing a nested key, use "." as a separator.
 Examples:
 .Pp
 .Dl # iocage set boot=1 notes="Example note." testjail -P foo.bar.baz=VALUE PLUGIN
-.Pp
 .\" == SNAPLIST ==
 .It Cm snaplist
 List snapshots of a jail.
@@ -934,7 +938,6 @@ Example:
 .Dl # iocage snaplist examplejail1
 .Pp
 .Dl # iocage snaplist FOO -s name
-.Pp
 .\" == SNAPREMOVE ==
 .It Cm snapremove
 Delete snapshots of the specified jail.
@@ -951,7 +954,6 @@ Options:
 Example:
 .Pp
 .Dl # iocage snapremove -n snapshottest1 examplejail1
-.Pp
 .\" == SNAPSHOT ==
 .It Cm snapshot
 Create a ZFS snapshot of the specified jail.
@@ -967,7 +969,6 @@ The user created snapshot name.
 Example:
 .Pp
 .Dl # iocage snapshot examplejail1 -n snapshottest1
-.Pp
 .\" == START ==
 .It Cm start
 Start a jail identified by
@@ -988,7 +989,6 @@ Jails with lower priority start first.
 Example:
 .Pp
 .Dl # iocage start examplejail1
-.Pp
 .\" == STOP ==
 .It Cm stop
 Stop a jail identified by
@@ -1011,17 +1011,25 @@ Example:
 .Dl # iocage stop 6ffe99a9
 .Pp
 Stop the jail identified by the shortened UUID.
-.Pp
 .\" == UPDATE ==
 .It Cm update
 Runs
 .Cm freebsd-update
 to update the specified jail to the latest patch level.
 .Pp
+Options:
+.Bl -tag -width "[-s | --server TEXT]"
+.It Op Fl NV | -noverify
+Disable verifying the SSL cert for HTTP fetching.
+.It Op Fl s | -server Ar TEXT
+Define the server from which to fetch the RELEASE.
+.It Op Fl V | -verify
+Enable verifying the SSL cert for HTTP fetching.
+.El
+.Pp
 Example:
 .Pp
 .Dl # iocage update examplejail1
-.Pp
 .\" == UPGRADE ==
 .It Cm upgrade
 Runs
@@ -1037,10 +1045,10 @@ Options:
 .Pp
 Example:
 .Pp
-.Dl # iocage upgrade examplejail2 -r 11.0-RELEASE
+.Dl # iocage upgrade examplejail2 -r 15.1-RELEASE
 .Pp
 To upgrade, the release must be locally available.
-.Pp
+.El
 .Sh PROPERTIES
 The Source listed with each property shows whether it is a local
 .Nm
@@ -1074,7 +1082,7 @@ Only applies when
 and
 .Ql assign_localhost=1 .
 Assign the jail localhost IP address to a custom IP address instead
-of the first available 
+of the first available
 .Dq 127.0.0.#
 address.
 .Nm
@@ -1199,7 +1207,7 @@ default route inside a VNET jail.
 .It Pf defaultrouter6= Op none | ip6address
 Setting this property to anything other than none configures a
 default IPv6 route inside a VNET jail.
-.It Pf resolver= Op none | nameserver IP;nameserver IP;search domain.local
+.It Pf resolver= Op none | nameserver IP;nameserver IP;search domain.local | /dev/null
 Set the jail's resolver
 .Pq resolv.conf .
 Fields must be delimited with a semicolon.
@@ -1209,6 +1217,9 @@ Semicolons are translated to newlines in
 If the resolver is set to none (default) the jail inherits the
 .Pa resolv.conf
 file from the host.
+.Pp
+If the resolver is set to /dev/null, iocage will not attempt to set the jail's
+.Pa resolv.conf .
 .It ip6_addr, ip6_saddrsel, ip6
 A set of IPv6 options for the prison, the counterparts to ip4_addr,
 ip4_saddrsel and ip4 above.
@@ -1281,7 +1292,7 @@ Source:
 .Xr jail 8
 .It Pf mount_devfs= Op  1 | 0
 Mount a
-.Xr devfs 5
+.Xr devfs 4
 filesystem on the chrooted
 .Pa /dev
 directory, and apply the ruleset in the devfs_ruleset parameter (or
@@ -1411,12 +1422,13 @@ Source:
 .Xr jail 8
 .It Pf mount_fdescfs= Op 1 | 0
 Mount a
-.Xr fdescfs 5
+.Xr fdescfs 4
 filesystem in the jail's
 .Pa /dev/fd
 directory.
 Note: This is not supported on
-.Fx 9.3 .
+.Fx
+9.3 .
 .Pp
 Default: 1
 .Pp
@@ -1424,7 +1436,7 @@ Source:
 .Xr jail 8
 .It Pf mount_procfs= Op 1 | 0
 Mount a
-.Xr procfs 5
+.Xr procfs 4
 filesystem in the jail's
 .Pa /dev/proc
 directory.
@@ -1491,11 +1503,12 @@ Default: 0
 .Pp
 Source: local
 .It Pf jail_zfs_dataset= Op iocage/jails/UUID/root/data | zfs_filesystem
-The dataset to be jailed and fully handed over to a jail.
-Takes the ZFS filesystem name without pool name.
+The dataset(s) to be jailed and fully handed over to a jail.
+Takes the ZFS filesystem name without the pool name.
+Multiple datasets may be specified, separated by whitespace.
 .Pp
 NOTE: only valid when
-.Ql jail_zfs=1.
+.Ql jail_zfs=1 .
 By default, the mountpoint is set to
 .Pa none .
 To mount this dataset, set its mountpoint inside the jail.
@@ -1533,13 +1546,15 @@ Source:
 .It Pf allow_sysvipc= Op 1 | 0
 Set whether a process in the jail has access to System V IPC
 primitives.
-Prior to FreeBSD 11.0, System V primitives share a single namespace
+Prior to
+.Fx
+11.0, System V primitives share a single namespace
 across the host and jail environments, meaning that processes within a
 jail would be able to communicate with, and potentially interfere
 with, processes outside of the jail, or in other jails.
 In
-.Fx 11.0
-and later, this setting is deprecated.
+.Fx
+11.0 and later, this setting is deprecated.
 Use sysvmsg, sysvsem, and sysvshm instead.
 .Pp
 Default: 0
@@ -1580,8 +1595,8 @@ Source:
 Allow access to SYSV IPC shared memory primitives in the same manner
 as sysvmsg.
 Ignored in
-.Fx 10.3
-and earlier.
+.Fx
+10.3 and earlier.
 .Pp
 Default: new
 .Pp
@@ -1643,13 +1658,29 @@ Default: 0
 .Pp
 Source:
 .Xr jail 8
+.It Pf allow_mount_fdescfs= Op 1 | 0
+Allow privileged users inside the jail to mount and unmount the fdescfs
+file system.
+This permission is effective only together with allow.mount and if
+enforce_statfs is set to a value lower than 2.
+.Pp
+Note: This is not supported on
+.Fx
+9.3.
+.Pp
+Default: 0
+.Pp
+Source:
+.Xr jail 8
 .It Pf allow_mount_fusefs= Op 1 | 0
 Allow privileged users inside the jail to mount and unmount fusefs file
 systems.
 This permission is effective only together with allow_mount and if
 enforce_statfs is set to a value lower than 2.
 .Pp
-Note: This requires FreeBSD 12.0 or later.
+Note: This requires
+.Fx
+12.0 or later.
 .Pp
 Default: 0
 .Pp
@@ -1675,13 +1706,35 @@ Default: 0
 .Pp
 Source:
 .Xr jail 8
+.It Pf allow_mount_linprocfs= Op 1 | 0
+Allow privileged users inside the jail to mount and unmount the linprocfs
+file system.
+This permission is effective only together with allow.mount and if
+enforce_statfs is set to a value lower than 2.
+.Pp
+Default: 0
+.Pp
+Source:
+.Xr jail 8
+.It Pf allow_mount_linsysfs= Op 1 | 0
+Privileged users inside the jail will be able to mount and
+unmount the linsysfs file system.
+This permission is effective only together with allow.mount and only
+when enforce_statfs is set to a value lower than 2.
+.Pp
+Default: 0
+.Pp
+Source:
+.Xr jail 8
 .It Pf allow_mount_tmpfs= Op 1 | 0
 Allow privileged users inside the jail to mount and unmount the tmpfs
 file system.
 This permission is effective only together with allow.mount and if
 enforce_statfs is set to a value lower than 2.
 .Pp
-Note: This is not supported on FreeBSD 9.3.
+Note: This is not supported on
+.Fx
+9.3.
 .Pp
 Default: 0
 .Pp
@@ -1738,12 +1791,14 @@ Source:
 .It Pf allow_vmm= Op 1 | 0
 Allow access to
 .Xr vmm 4
-inside the jail. The
+inside the jail.
+The
 .Xr vmm 4
 kernel module must be loaded for this to take effect.
 .Pp
 Note: This requires
-.Fx 12.0
+.Fx
+12.0
 or later.
 .Pp
 Default: 0
@@ -1818,7 +1873,7 @@ Set the jail type to basejail, empty or normal.
 Default: normal
 .Pp
 Source: local
-.It Pf release= Op 11.0-RELEASE | 10.3-RELEASE
+.It Pf release= Op 15.1-RELEASE | 14.4-RELEASE
 The release used at creation time.
 Can be set to any string if needed.
 .Pp
@@ -1951,7 +2006,7 @@ Interfaces are automatically released when the jail is removed.
 Default: none
 .Pp
 Source:
-.Xr jail(8)
+.Xr jail 8
 .It Pf vnet_default_interface= Op none | Ar INTERFACE
 Default network interface used for the VNET bridge interface in the jail.
 Only takes effect when VNET is set.
@@ -1973,7 +2028,7 @@ iocage fetch
 .Pp
 Create first jail:
 .Bd -literal -offset indent
-iocage create -r 11.0-RELEASE -n myjail
+iocage create -r 15.1-RELEASE -n myjail
 .Ed
 .Pp
 List jails:
@@ -2038,7 +2093,7 @@ net.link.bridge.pfil_member=0
 .Ed
 .Pp
 See
-.Lk https://github.com/iocage/iocage
+.Lk https://github.com/freebsd/iocage
 for more information.
 .Sh SEE ALSO
 .Xr cpuset 1 ,
@@ -2053,23 +2108,23 @@ for more information.
 .Xr zfs 8 ,
 .Xr zpool 8 ,
 .Xr VNET 9
-.Sh BUGS
-Please report bugs, issues, and feature requests to
-.Lk https://github.com/iocage/iocage/issues
 .Sh AUTHORS
 .Nm
 was developed by
 .An -nosplit
-.An Peter Toth,
-.An Brandon Schneider,
+.An Peter Toth ,
+.An Brandon Schneider ,
 and
 .An Stefan Gronke .
 .Pp
 This manual page was written by
-.An Warren Block,
-.An Tim Moore,
-.An Peter Toth,
+.An Warren Block ,
+.An Tim Moore ,
+.An Peter Toth ,
 and
 .An Brandon Schneider .
 .Sh SPECIAL THANKS
 Sichendra Bista - for his ever willing attitude and ideas.
+.Sh BUGS
+Please report bugs, issues, and feature requests to
+.Lk https://github.com/freebsd/iocage/issues
