@@ -75,7 +75,7 @@ def all_properties(
     fs = defaultdict(dict)
     for line in filter(bool, data):
         name, prop = line.split('\t')[:2]
-        fs[name][prop.strip()] = line.split(
+        fs[name.strip()][prop.strip()] = line.split(
             '\t', maxsplit=2
         )[-1].strip()
 
@@ -183,7 +183,8 @@ def destroy_zfs_resource(resource, recursive=False, force=False):
     if recursive:
         cmd.append('-r')
     if force:
-        cmd.append('-Rf')
+        # Uppercase -R also destroys clones outside the target hierarchy.
+        cmd.append('-f')
     return run([*cmd, resource]).returncode == 0
 
 

@@ -37,7 +37,7 @@ class Dataset(Resource):
         if self.cache:
             self._properties = deepcopy(cache.datasets.get(self.resource_name))
 
-    def create(self, data):
+    def create(self, data={}):
         cache.reset()
         return create_dataset({'name': self.resource_name, **data})
 
@@ -78,11 +78,13 @@ class Dataset(Resource):
     def mounted(self):
         return self.properties['mounted'] == 'yes'
 
-    def get_dependents(self, depth=1, ds_cache=True):
+    def get_dependents(
+        self, depth=1, ds_cache=True, include_locked=False
+    ):
         gd = cache.dependents if ds_cache else get_dependents
         for d in gd(self.resource_name, depth):
             ds = Dataset(d, cache=ds_cache)
-            if ds.locked:
+            if not include_locked and ds.locked:
                 continue
             yield ds
 

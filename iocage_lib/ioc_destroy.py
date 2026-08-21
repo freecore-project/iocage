@@ -45,7 +45,9 @@ class IOCDestroy:
         self.callback = callback
         self.iocroot_datasets = [
             d.name for d in
-            Dataset(os.path.join(self.pool, 'iocage')).get_dependents()
+            Dataset(os.path.join(self.pool, 'iocage')).get_dependents(
+                ds_cache=False, include_locked=True
+            )
         ]
         self.path = None
         self.j_conf = None
@@ -55,7 +57,7 @@ class IOCDestroy:
             if 'jails' not in dataset:
                 continue
 
-            dataset = Dataset(dataset)
+            dataset = Dataset(dataset, cache=False)
             if not dataset.exists:
                 # Keeping old behavior, retrieving props safely
                 continue
@@ -106,7 +108,7 @@ class IOCDestroy:
         else:
             umount_path = self.path
 
-        ds = Dataset(dataset)
+        ds = Dataset(dataset, cache=False)
         ds_properties = ds.properties if ds.exists else {}
         if self.path == '-' or ds_properties.get('type') == 'snapshot':
             # This is either not mounted or doesn't exist anymore,
@@ -165,7 +167,7 @@ class IOCDestroy:
 
     def __destroy_dataset__(self, dataset):
         """Destroys the given datasets and snapshots."""
-        ds = Dataset(dataset)
+        ds = Dataset(dataset, cache=False)
         ds.destroy(recursive=True, force=True)
 
         if dataset.endswith('jails'):
@@ -183,7 +185,7 @@ class IOCDestroy:
 
             jail_datasets = Dataset(
                 f'{self.pool}/iocage/jails'
-            ).get_dependents()
+            ).get_dependents(ds_cache=False, include_locked=True)
             for jail in jail_datasets:
                 with iocage_lib.ioc_exceptions.ignore_exceptions(
                         BaseException):
@@ -207,7 +209,9 @@ class IOCDestroy:
         try:
             datasets = [
                 d.name
-                for d in Dataset(path).get_dependents(depth=None)
+                for d in Dataset(path).get_dependents(
+                    depth=None, ds_cache=False, include_locked=True
+                )
             ]
         except (Exception, SystemExit):
             # Dataset can't be found, we don't care
@@ -239,7 +243,7 @@ class IOCDestroy:
             datasets.reverse()
 
             for dataset in datasets:
-                ds = Dataset(dataset)
+                ds = Dataset(dataset, cache=False)
                 if not ds.exists:
                     continue
                 self.path = ds.path
@@ -261,19 +265,26 @@ class IOCDestroy:
         A convenience wrapper to call __stop_jails__ and
          __destroy_parse_datasets__
         """
-        dataset_type, uuid = path.rsplit("/")[-2:]
-
         if clean:
             self.__destroy_parse_datasets__(path, clean=clean)
 
             return
 
+        dataset_type, uuid = path.rstrip('/').rsplit('/')[-2:]
+        if dataset_type not in ('jails', 'templates') or uuid in ('', '.', '..'):
+            raise ValueError(f'Invalid jail dataset path: {path}')
+
         try:
             iocage_lib.ioc_stop.IOCStop(uuid, path, silent=True)
-        except (FileNotFoundError, RuntimeError, SystemExit, iocage_lib.ioc_exceptions.JailMissingConfiguration):
+        except (
+            FileNotFoundError,
+            RuntimeError,
+            SystemExit,
+            iocage_lib.ioc_exceptions.JailMissingConfiguration,
+        ):
             # Broad exception as we don't care why this failed. iocage
             # may have been killed before configuration could be made,
-            # it's meant to be nuked or is a malformed jail which does not has it's configuration file present
+            # it's meant to be nuked.
             pass
 
         try:

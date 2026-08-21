@@ -23,6 +23,10 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 import pytest
+import inspect
+import tempfile
+import os
+import re
 
 
 require_root = pytest.mark.require_root
@@ -53,4 +57,88 @@ def test_02_start_rc_jail(invoke_cli, resource_selector):
     for jail in resource_selector.rcjails:
         assert jail.running is True, f'{jail.name} not running'
 
+
+# Network-related tests belong here because the code is only executed at jail
+# start time.
+
+@require_root
+@require_zpool
+def test_03_create_and_start_nobridge_vnet_jail(release, jail, invoke_cli):
+    jail = jail('nobridge_jail')
+
+    fd, path = tempfile.mkstemp()
+
+    try:
+        with os.fdopen(fd, 'w') as tmp:
+            tmp.write(inspect.cleandoc(f"""
+                #!/bin/sh
+                jailname=ioc-{jail.name}
+                jid=$(jls -j $jailname jid)
+                iface=vnet0.$jid
+                ifconfig $iface inet6 fe80::1/64
+            """))
+        os.chmod(path, 0o755)
+
+        invoke_cli([
+            'create', '-r', release, '-n', jail.name,
+            'boot=on', 'vnet=on',
+            'interfaces=vnet0:none', 'vnet_default_interface=none',
+            f'ip4_addr=none', 'ip6_addr=vnet0|fe80::2/64',
+            'defaultrouter6=none', 'defaultrouter=none',
+            f'exec_poststart={path}'
+        ])
+
+        assert jail.exists is True
+        assert jail.running is True
+
+        stdout, stderr = jail.run_command(['ifconfig'])
+        assert bool(stderr) is False, f'Ifconfig returned an error: {stderr}'
+        assert 'fe80::2%epair0b' in stdout
+
+        stdout, stderr = jail.run_command(['ifconfig'], jailed=False)
+
+        assert bool(stderr) is False, f'Ifconfig returned an error: {stderr}'
+        assert re.search(r'bridge[0-9]', stdout) is None, \
+            'Unexpected bridge was created.'
+        assert f'fe80::1%vnet0.{jail.jid}' in stdout
+        assert (f'description: associated with jail: {jail.name} '
+                'as nic: epair0b') in stdout
+
+        stdout, stderr = jail.run_command(
+            ['ping', '-c', '1', f'fe80::2%vnet0.{jail.jid}'],
+            jailed=False)
+        assert bool(stderr) is False, f'Ping returned an error: {stderr}'
+
+        invoke_cli([
+            'destroy', jail.name, '-f'
+        ])
+
+    finally:
+        os.remove(path)
+
+
 # TODO: Let's also start jails in a single command to test that out
+
+@require_root
+@require_zpool
+def test_04_vnet_jail_with_loopback_alias(release, jail, invoke_cli):
+    jail = jail('loopback_alias_jail')
+
+    invoke_cli([
+        'create', '-r', release, '-n', jail.name,
+        'boot=on', 'vnet=on', 'defaultrouter=none',
+        f'ip4_addr=lo0|192.168.2.10'
+    ])
+
+    assert jail.exists is True
+    assert jail.running is True
+
+    stdout, stderr = jail.run_command(['ifconfig', 'lo0'])
+    assert bool(stderr) is False, f'Ifconfig returned an error: {stderr}'
+    assert '192.168.2.10' in stdout, (
+        'Could not set address on loopback interface.'
+    )
+
+    invoke_cli([
+        'destroy', jail.name, '-f'
+    ])

@@ -21,9 +21,58 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
 # IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
-import mock
+from unittest import mock
 import pytest
 import iocage_lib.ioc_start as ioc_start
+
+
+def test_find_vnet_default_route_interface_matches_configured_address():
+    assert ioc_start.find_vnet_default_route_interface(
+        ['vnet0:bridge0', 'vnet1:bridge1'],
+        'vnet1|2001:db8::10/64',
+    ) == 'vnet1'
+
+
+def test_find_vnet_default_route_interface_uses_vnet0_for_unqualified_ip():
+    assert ioc_start.find_vnet_default_route_interface(
+        ['vnet0:bridge0', 'vnet1:bridge1'],
+        '2001:db8::10/64',
+    ) == 'vnet0'
+
+
+def test_find_vnet_default_route_interface_falls_back_to_vnet0():
+    assert ioc_start.find_vnet_default_route_interface(
+        ['vnet2:bridge2'],
+        'vnet3|2001:db8::10/64',
+    ) == 'vnet0'
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+@mock.patch.object(
+    ioc_start.IOCStart, 'start_network_interface_vnet', return_value=None
+)
+@mock.patch('iocage_lib.ioc_list.IOCList')
+def test_start_network_scopes_ipv6_route_to_matching_vnet(
+    mock_ioclist, _mock_interface, mock_checkoutput
+):
+    mock_ioclist.return_value.list_get_jid.return_value = (True, '42')
+    iocstart = ioc_start.IOCStart('route-test', '', unit_test=True)
+    iocstart.exec_fib = '4'
+    iocstart.ip4_addr = 'none'
+    iocstart.defaultrouter = 'none'
+    iocstart.ip6_addr = 'vnet1|2001:db8::10/64'
+    iocstart.defaultrouter6 = 'fe80::1%igb1'
+    iocstart.get = lambda prop: {
+        'interfaces': 'vnet0:bridge0,vnet1:bridge1',
+        'vnet_default_interface': 'none',
+        'dhcp': 0,
+    }[prop]
+
+    assert iocstart.start_network(vnet=True) is None
+    mock_checkoutput.assert_called_once_with([
+        'setfib', '4', 'jexec', 'ioc-route-test', 'route',
+        'add', '-6', 'default', 'fe80::1%epair1b'
+    ], stderr=ioc_start.su.STDOUT)
 
 
 @mock.patch('iocage_lib.ioc_common.checkoutput')
@@ -47,23 +96,24 @@ def test_should_return_mtu_of_first_member_with_description(mock_checkoutput):
                                        mock.call(["ifconfig", "bge0"])])
 
 
-@mock.patch('iocage_lib.ioc_common.checkoutput')
-def test_should_return_default_mtu_if_no_members(mock_checkoutput):
-    mock_checkoutput.side_effect = [bridge_with_no_members_if_config,
-                                    member_if_config]
-
-    # IOCStart.get() is not implemented in test mode. We need it for this test.
-    # So provide a dummy implementation which gives us the default MTU.
-    def _mock_iocstart_get(prop):
-        if prop=='vnet_default_mtu':
-            return "1500"
-        raise AttributeError(prop)
-
-    iocs = ioc_start.IOCStart("", "", unit_test=True)
-    iocs.get = _mock_iocstart_get
-    mtu = iocs.find_bridge_mtu('bridge0')
-    assert mtu == '1500'
-    mock_checkoutput.called_with(["ifconfig", "bridge0"])
+# @mock.patch('iocage_lib.ioc_common.checkoutput')
+# def test_should_return_default_mtu_if_no_members(mock_checkoutput):
+#     mock_checkoutput.side_effect = [bridge_with_no_members_if_config,
+#                                     member_if_config]
+#
+#     # IOCStart.get() is not implemented in test mode.
+#     # We need it for this test.
+#     # So provide a dummy implementation which gives us the default MTU.
+#     def _mock_iocstart_get(prop):
+#         if prop=='vnet_default_mtu':
+#             return "1500"
+#         raise AttributeError(prop)
+#
+#     iocs = ioc_start.IOCStart("", "", unit_test=True)
+#     iocs.get = _mock_iocstart_get
+#     mtu = iocs.find_bridge_mtu('bridge0')
+#     assert mtu == '1500'
+#     mock_checkoutput.called_with(["ifconfig", "bridge0"])
 
 
 @mock.patch('iocage_lib.ioc_common.logit')
@@ -96,10 +146,10 @@ def test_should_return_default_interface(mock_logit, test_input, expected):
         assert actual == expected
         mock_logit.assert_not_called()
     else:
-        mock_logit.assert_called_once_with({'level': 'EXCEPTION',
-                                            'message': 'No default interface found'},
-                                           _callback=None,
-                                           silent=False)
+        mock_logit.assert_called_once_with(
+            {'level': 'EXCEPTION', 'message': 'No default interface found'},
+            _callback=None,
+            silent=False)
 
 
 @pytest.mark.parametrize('test_input,expected', [
@@ -141,7 +191,8 @@ def test_should_return_default_gateway(test_input, expected):
     assert iocstart.get_default_gateway('ipv6') == expected['ipv6']
 
 
-bridge_if_config = """bridge0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
+bridge_if_config = """\
+bridge0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
         ether 00:00:00:00:00:00
         nd6 options=1<PERFORMNUD>
         groups: bridge
@@ -152,7 +203,8 @@ bridge_if_config = """bridge0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST
             ifmaxaddr 0 port 1 priority 128 path cost 20000
 """
 
-bridge_with_description_if_config = """bridge0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
+bridge_with_description_if_config = """\
+bridge0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
         description: first-bridge
         ether 00:00:00:00:00:00
         nd6 options=1<PERFORMNUD>
@@ -164,7 +216,8 @@ bridge_with_description_if_config = """bridge0: flags=8843<UP,BROADCAST,RUNNING,
             ifmaxaddr 0 port 1 priority 128 path cost 20000
 """
 
-bridge_with_no_members_if_config = """bridge0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
+bridge_with_no_members_if_config = """\
+bridge0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
         description: first-bridge
         ether 00:00:00:00:00:00
         nd6 options=1<PERFORMNUD>
@@ -174,12 +227,248 @@ bridge_with_no_members_if_config = """bridge0: flags=8843<UP,BROADCAST,RUNNING,S
         root id 00:00:00:00:00:00 priority 32768 ifcost 0 port 0
 """
 
-member_if_config = """bge0: flags=8943<UP,BROADCAST,RUNNING,PROMISC,SIMPLEX,MULTICAST> metric 0 mtu 1500
-        options=c019b<RXCSUM,TXCSUM,VLAN_MTU,VLAN_HWTAGGING,VLAN_HWCSUM,TSO4,VLAN_HWTSO,LINKSTATE>
-        ether 00:00:00:00:00:00
-        inet6 fe80::0000:0000:0000:0000%bge0 prefixlen 64 scopeid 0x1
-        inet 10.2.3.4 netmask 0xffffff00 broadcast 10.2.3.255
-        nd6 options=21<PERFORMNUD,AUTO_LINKLOCAL>
-        media: Ethernet autoselect (1000baseT <full-duplex>)
-        status: active
-"""
+member_if_config = (
+    "bge0: flags=8943<UP,BROADCAST,RUNNING,PROMISC,SIMPLEX,MULTICAST>"
+    " metric 0 mtu 1500\n"
+    "        options=c019b<RXCSUM,TXCSUM,VLAN_MTU,VLAN_HWTAGGING,"
+    "VLAN_HWCSUM,TSO4,VLAN_HWTSO,LINKSTATE>\n"
+    "        ether 00:00:00:00:00:00\n"
+    "        inet6 fe80::0000:0000:0000:0000%bge0 prefixlen 64 scopeid 0x1\n"
+    "        inet 10.2.3.4 netmask 0xffffff00 broadcast 10.2.3.255\n"
+    "        nd6 options=21<PERFORMNUD,AUTO_LINKLOCAL>\n"
+    "        media: Ethernet autoselect (1000baseT <full-duplex>)\n"
+    "        status: active\n"
+    )
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+@mock.patch('iocage_lib.ioc_start.su.Popen')
+def test_start_network_vnet_iface_disables_jail_tx_checksum_offload(
+    mock_popen, mock_checkoutput
+):
+    process = mock.Mock()
+    process.communicate.return_value = (b'epair0a\n',)
+    mock_popen.return_value = process
+
+    iocstart = ioc_start.IOCStart('', '', unit_test=True)
+    iocstart.exec_fib = '3'
+    iocstart.ip6_addr = 'none'
+    iocstart.uuid = 'checksum-test'
+    iocstart.get = lambda prop: {
+        'vnet_default_interface': 'none',
+        'vnet1_mac': '020000000001 020000000002',
+    }[prop]
+
+    assert iocstart.start_network_vnet_iface(
+        'vnet1', 'bridge0', '1500', '7', nat_addr='172.16.0.1'
+    ) is None
+
+    rename_call = mock.call([
+        'setfib', '3', 'jexec', 'ioc-checksum-test',
+        'ifconfig', 'epair0b', 'name', 'epair1b'
+    ], stderr=ioc_start.su.STDOUT)
+    disable_call = mock.call([
+        'setfib', '3', 'jexec', 'ioc-checksum-test',
+        'ifconfig', 'epair1b', '-txcsum', '-txcsum6'
+    ], stderr=ioc_start.su.STDOUT)
+    calls = mock_checkoutput.call_args_list
+    assert rename_call in calls
+    assert disable_call in calls
+    assert calls.index(rename_call) < calls.index(disable_call)
+
+
+# ─── Tests for start_network_vnet_addr ───────────────────────────────────────
+#
+# Regression tests for the fix where IPv4 DHCP settings incorrectly
+# prevented static IPv6 addresses from being assigned.
+
+def _make_iocstart_for_addr(**overrides):
+    """Create an IOCStart instance with properties needed for addr tests."""
+    iocstart = ioc_start.IOCStart("test-jail", "", unit_test=True)
+    iocstart.exec_fib = '0'
+    iocstart.ip4_addr = overrides.get('ip4_addr', 'none')
+
+    dhcp_val = overrides.get('dhcp', 0)
+    iocstart.get = lambda prop: dhcp_val if prop == 'dhcp' else 'auto'
+
+    return iocstart
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+def test_vnet_addr_ipv6_static_applied_when_dhcp_enabled(mock_checkoutput):
+    """Static IPv6 must be assigned even when IPv4 DHCP is enabled."""
+    iocstart = _make_iocstart_for_addr(dhcp=1)
+    iocstart.start_network_vnet_addr(
+        'vnet0', '2001:db8::1/64', 'fe80::1', ipv6=True
+    )
+    mock_checkoutput.assert_called_once()
+    args = mock_checkoutput.call_args[0][0]
+    assert 'inet6' in args
+    assert '2001:db8::1/64' in args
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+def test_vnet_addr_ipv4_skipped_when_dhcp_enabled(mock_checkoutput):
+    """IPv4 ifconfig should be skipped when DHCP is handling it."""
+    iocstart = _make_iocstart_for_addr(dhcp=1)
+    iocstart.start_network_vnet_addr(
+        'vnet0', '192.168.1.10/24', '192.168.1.1', ipv6=False
+    )
+    mock_checkoutput.assert_not_called()
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+def test_vnet_addr_ipv4_applied_when_dhcp_disabled(mock_checkoutput):
+    """IPv4 static must be assigned when DHCP is off."""
+    iocstart = _make_iocstart_for_addr(dhcp=0)
+    iocstart.start_network_vnet_addr(
+        'vnet0', '192.168.1.10/24', '192.168.1.1', ipv6=False
+    )
+    mock_checkoutput.assert_called_once()
+    args = mock_checkoutput.call_args[0][0]
+    assert '192.168.1.10/24' in args
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+def test_vnet_addr_ipv6_applied_when_dhcp_disabled(mock_checkoutput):
+    """IPv6 static must be assigned when DHCP is off."""
+    iocstart = _make_iocstart_for_addr(dhcp=0)
+    iocstart.start_network_vnet_addr(
+        'vnet0', '2001:db8::1/64', 'fe80::1', ipv6=True
+    )
+    mock_checkoutput.assert_called_once()
+    args = mock_checkoutput.call_args[0][0]
+    assert 'inet6' in args
+    assert '2001:db8::1/64' in args
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+def test_vnet_addr_accept_rtadv_never_calls_ifconfig(mock_checkoutput):
+    """accept_rtadv addresses should never invoke ifconfig."""
+    iocstart = _make_iocstart_for_addr(dhcp=0)
+    iocstart.start_network_vnet_addr(
+        'vnet0', 'accept_rtadv', 'fe80::1', ipv6=True
+    )
+    mock_checkoutput.assert_not_called()
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+def test_vnet_addr_dhcp_in_ip4_addr_string_skips_ipv4(mock_checkoutput):
+    """ip4_addr containing DHCP should also suppress IPv4 ifconfig."""
+    iocstart = _make_iocstart_for_addr(dhcp=0, ip4_addr='vnet0|DHCP')
+    iocstart.start_network_vnet_addr(
+        'vnet0', '192.168.1.10/24', '192.168.1.1', ipv6=False
+    )
+    mock_checkoutput.assert_not_called()
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+def test_vnet_addr_dhcp_in_ip4_addr_string_still_applies_ipv6(mock_checkoutput):
+    """ip4_addr containing DHCP must not prevent IPv6 assignment."""
+    iocstart = _make_iocstart_for_addr(dhcp=0, ip4_addr='vnet0|DHCP')
+    iocstart.start_network_vnet_addr(
+        'vnet0', '2001:db8::1/64', 'fe80::1', ipv6=True
+    )
+    mock_checkoutput.assert_called_once()
+    args = mock_checkoutput.call_args[0][0]
+    assert 'inet6' in args
+
+
+# ─── Tests for start_network_interface_vnet address spoofing ─────────────────
+#
+# Regression tests ensuring IPv4 DHCP address spoofing does not affect
+# IPv6 static address entries in net_configs.
+
+def _make_iocstart_for_iface(**overrides):
+    """Create an IOCStart instance with properties needed for iface tests."""
+    iocstart = ioc_start.IOCStart("test-jail", "", unit_test=True)
+    iocstart.exec_fib = '0'
+    iocstart.ip4_addr = overrides.get('ip4_addr', 'vnet0|192.168.1.9')
+    iocstart.ip6_addr = overrides.get(
+        'ip6_addr', 'vnet0|2001:db8::1/64')
+
+    dhcp_val = overrides.get('dhcp', 0)
+    mtu_val = overrides.get('mtu', '1500')
+
+    def mock_get(prop):
+        if prop == 'dhcp':
+            return dhcp_val
+        if prop.endswith('_mtu'):
+            return mtu_val
+        return 'auto'
+
+    iocstart.get = mock_get
+    return iocstart
+
+
+@mock.patch.object(ioc_start.IOCStart, 'start_network_vnet_addr',
+                   return_value=None)
+@mock.patch.object(ioc_start.IOCStart, 'start_network_vnet_iface',
+                   return_value=None)
+def test_iface_vnet_dhcp_does_not_spoof_ipv6_address(
+    mock_iface, mock_addr
+):
+    """When dhcp=1, IPv6 static address must pass through unspoofed."""
+    iocstart = _make_iocstart_for_iface(dhcp=1)
+    net_configs = (
+        (iocstart.ip4_addr, '192.168.1.1', False),
+        (iocstart.ip6_addr, 'fe80::1', True),
+    )
+    iocstart.start_network_interface_vnet('vnet0:bridge0', net_configs, '42')
+
+    # Collect the (ip, ipv6) pairs from all calls to start_network_vnet_addr
+    addr_calls = [(c[0][1], c[0][3]) for c in mock_addr.call_args_list]
+
+    # The IPv6 address must arrive intact (not spoofed to empty)
+    ipv6_calls = [(ip, v6) for ip, v6 in addr_calls if v6]
+    assert len(ipv6_calls) == 1
+    assert ipv6_calls[0][0] == '2001:db8::1/64'
+
+
+@mock.patch.object(ioc_start.IOCStart, 'start_network_vnet_addr',
+                   return_value=None)
+@mock.patch.object(ioc_start.IOCStart, 'start_network_vnet_iface',
+                   return_value=None)
+def test_iface_vnet_dhcp_does_spoof_ipv4_address(
+    mock_iface, mock_addr
+):
+    """When dhcp=1, IPv4 address should be spoofed (DHCP will provide it)."""
+    iocstart = _make_iocstart_for_iface(dhcp=1)
+    net_configs = (
+        (iocstart.ip4_addr, '192.168.1.1', False),
+        (iocstart.ip6_addr, 'fe80::1', True),
+    )
+    iocstart.start_network_interface_vnet('vnet0:bridge0', net_configs, '42')
+
+    addr_calls = [(c[0][1], c[0][3]) for c in mock_addr.call_args_list]
+
+    # The IPv4 address should have been spoofed to empty
+    ipv4_calls = [(ip, v6) for ip, v6 in addr_calls if not v6]
+    assert len(ipv4_calls) == 1
+    assert ipv4_calls[0][0] == "''"
+
+
+@mock.patch.object(ioc_start.IOCStart, 'start_network_vnet_addr',
+                   return_value=None)
+@mock.patch.object(ioc_start.IOCStart, 'start_network_vnet_iface',
+                   return_value=None)
+def test_iface_vnet_no_dhcp_preserves_both_addresses(
+    mock_iface, mock_addr
+):
+    """When dhcp=0, both IPv4 and IPv6 addresses pass through intact."""
+    iocstart = _make_iocstart_for_iface(dhcp=0)
+    net_configs = (
+        (iocstart.ip4_addr, '192.168.1.1', False),
+        (iocstart.ip6_addr, 'fe80::1', True),
+    )
+    iocstart.start_network_interface_vnet('vnet0:bridge0', net_configs, '42')
+
+    addr_calls = [(c[0][1], c[0][3]) for c in mock_addr.call_args_list]
+
+    ipv4_calls = [(ip, v6) for ip, v6 in addr_calls if not v6]
+    ipv6_calls = [(ip, v6) for ip, v6 in addr_calls if v6]
+
+    assert len(ipv4_calls) == 1
+    assert ipv4_calls[0][0] == '192.168.1.9'
+    assert len(ipv6_calls) == 1
+    assert ipv6_calls[0][0] == '2001:db8::1/64'

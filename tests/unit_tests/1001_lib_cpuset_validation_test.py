@@ -1,6 +1,9 @@
 from unittest.mock import Mock, patch
 
-from iocage_lib.ioc_json import IOCCpuset
+import pytest
+
+from iocage_lib.ioc_exceptions import CommandFailed
+from iocage_lib.ioc_json import IOCCpuset, IOCRCTL
 
 # For cpuset props we would like to test the following scenarios
 # 1) 0,1,2,3
@@ -102,12 +105,89 @@ def test_11_subset_of_cpus_in_range():
 
 # Tests for point 3 and 4
 def test_12_off_value():
-    assert IOCCpuset.validate_cpuset_prop('off', False) is False
+    with patch.object(IOCCpuset, 'retrieve_cpu_sets', return_value=15):
+        assert IOCCpuset.validate_cpuset_prop('off', False) is False
 
 
 def test_13_all_value():
-    assert IOCCpuset.validate_cpuset_prop('all', False) is False
+    with patch.object(IOCCpuset, 'retrieve_cpu_sets', return_value=15):
+        assert IOCCpuset.validate_cpuset_prop('all', False) is False
 
 
 def test_14_invalid_value_not_allowed():
-    assert IOCCpuset.validate_cpuset_prop('gibberish', False) is True
+    with patch.object(IOCCpuset, 'retrieve_cpu_sets', return_value=15):
+        assert IOCCpuset.validate_cpuset_prop('gibberish', False) is True
+
+
+def test_set_cpuset_returns_failure_for_expected_command_error():
+    with patch(
+        'iocage_lib.ioc_exec.SilentExec',
+        side_effect=CommandFailed('cpuset failed'),
+    ):
+        assert IOCCpuset('test').set_cpuset('0-3') is True
+
+
+def test_set_cpuset_does_not_suppress_unexpected_exception():
+    with patch(
+        'iocage_lib.ioc_exec.SilentExec',
+        side_effect=RuntimeError('unexpected cpuset error'),
+    ), pytest.raises(RuntimeError, match='unexpected cpuset error'):
+        IOCCpuset('test').set_cpuset('0-3')
+
+
+def test_retrieve_cpu_sets_parses_freebsd_15_output():
+    output = Mock(stdout=(
+        'cpuset 0 mask: 0, 1, 2, 3, 4, 5, 6, 7, '
+        '8, 9, 10, 11, 12, 13, 14, 15\n'
+    ))
+    with patch(
+        'iocage_lib.ioc_exec.SilentExec', return_value=output
+    ) as execute:
+        assert IOCCpuset.retrieve_cpu_sets() == 15
+
+    execute.assert_called_once_with(
+        ['cpuset', '-g', '-s', '0'],
+        None, unjailed=True, decode=True
+    )
+
+
+def test_retrieve_cpu_sets_returns_fallback_for_expected_command_error():
+    with patch(
+        'iocage_lib.ioc_exec.SilentExec',
+        side_effect=CommandFailed('cpuset failed'),
+    ):
+        assert IOCCpuset.retrieve_cpu_sets() == -2
+
+
+def test_retrieve_cpu_sets_does_not_suppress_unexpected_exception():
+    with patch(
+        'iocage_lib.ioc_exec.SilentExec',
+        side_effect=RuntimeError('unexpected cpuset query error'),
+    ), pytest.raises(RuntimeError, match='unexpected cpuset query error'):
+        IOCCpuset.retrieve_cpu_sets()
+
+
+def test_rctl_rules_exist_matches_requested_rule():
+    output = Mock(stdout=(
+        'jail:ioc-test:memoryuse:deny=1G\n'
+        'jail:ioc-other:maxproc:deny=100\n'
+    ))
+    with patch('iocage_lib.ioc_exec.SilentExec', return_value=output):
+        assert IOCRCTL('test').rctl_rules_exist('memoryuse') is True
+        assert IOCRCTL('test').rctl_rules_exist('maxproc') is False
+
+
+def test_rctl_rules_exist_returns_fallback_for_expected_command_error():
+    with patch(
+        'iocage_lib.ioc_exec.SilentExec',
+        side_effect=CommandFailed('rctl failed'),
+    ):
+        assert IOCRCTL('test').rctl_rules_exist() is False
+
+
+def test_rctl_rules_exist_does_not_suppress_unexpected_exception():
+    with patch(
+        'iocage_lib.ioc_exec.SilentExec',
+        side_effect=RuntimeError('unexpected rctl error'),
+    ), pytest.raises(RuntimeError, match='unexpected rctl error'):
+        IOCRCTL('test').rctl_rules_exist()
