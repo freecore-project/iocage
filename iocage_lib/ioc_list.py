@@ -30,7 +30,6 @@ import uuid as _uuid
 
 import iocage_lib.ioc_common
 import iocage_lib.ioc_json
-import iocage_lib.ioc_plugin
 import texttable
 
 from iocage_lib.dataset import Dataset
@@ -178,9 +177,8 @@ class IOCList(object):
 
         # We get an infinite float otherwise.
         table.set_cols_dtype(["t", "t"])
-        jail_list.insert(0, ["NAME", "IP4"])
-
-        table.add_rows(jail_list)
+        table.header(["NAME", "IP4"])
+        table.add_rows(jail_list, header=False)
 
         return table.draw()
 
@@ -190,7 +188,6 @@ class IOCList(object):
         active_jails = iocage_lib.ioc_common.get_active_jails()
         default_gateways = iocage_lib.ioc_common.get_host_gateways()
         jail_list = []
-        plugin_index_data = {}
 
         for jail in jails:
             try:
@@ -353,68 +350,22 @@ class IOCList(object):
                                   full_release, full_ip4, ip6, template,
                                   admin_portal, doc_url])
                 if self.plugin_data:
-                    if conf['plugin_repository'] not in plugin_index_data:
-                        repo_obj = iocage_lib.ioc_plugin.IOCPlugin(
-                            git_repository=conf['plugin_repository']
-                        )
-                        if not os.path.exists(repo_obj.git_destination):
-                            try:
-                                repo_obj.pull_clone_git_repo()
-                            except Exception as e:
-                                iocage_lib.ioc_common.logit(
-                                    {
-                                        'level': 'ERROR',
-                                        'message':
-                                            'Failed to clone '
-                                            f'{conf["plugin_repository"]} '
-                                            f'for {uuid_full}: {e}'
-                                    },
-                                    _callback=self.callback,
-                                    silent=self.silent
-                                )
-                        index_path = os.path.join(
-                            repo_obj.git_destination, 'INDEX'
-                        )
-                        if not os.path.exists(index_path):
-                            iocage_lib.ioc_common.logit(
-                                {
-                                    'level': 'ERROR',
-                                    'message':
-                                        f'{index_path} does not exist '
-                                        f'for {uuid_full} plugin.'
-                                },
-                                _callback=self.callback,
-                                silent=self.silent
-                            )
-                            plugin_index_data[
-                                conf['plugin_repository']
-                            ] = {}
-                        else:
-                            with open(index_path) as f:
-                                plugin_index_data[
-                                    conf['plugin_repository']
-                                ] = json.loads(f.read())
-                    elif not plugin_index_data[conf['plugin_repository']]:
-                        iocage_lib.ioc_common.logit(
-                            {
-                                'level': 'ERROR',
-                                'message':
-                                    'Unable to retrieve INDEX from '
-                                    f'{conf["plugin_repository"]} for '
-                                    f'{uuid_full}'
-                            },
-                            _callback=self.callback,
-                            silent=self.silent
-                        )
+                    plugin_manifest = {}
+                    plugin_name = conf['plugin_name']
+                    manifest_path = os.path.join(
+                        mountpoint, f'{plugin_name}.json'
+                    )
+                    try:
+                        with open(manifest_path) as f:
+                            plugin_manifest = json.load(f)
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        pass
 
-                    index_plugin_conf = plugin_index_data[
-                        conf['plugin_repository']
-                    ].get(conf['plugin_name'], {})
                     jail_list[-1].extend([
-                        conf['plugin_name'], conf['plugin_repository'],
-                        index_plugin_conf.get('primary_pkg'),
-                        index_plugin_conf.get('category'),
-                        index_plugin_conf.get('maintainer'),
+                        plugin_name, conf['plugin_repository'],
+                        plugin_manifest.get('primary_pkg'),
+                        plugin_manifest.get('category'),
+                        plugin_manifest.get('maintainer'),
                     ])
             elif self.full:
                 jail_list.append([jid, uuid, boot, state, jail_type,
@@ -443,23 +394,21 @@ class IOCList(object):
                 table.set_cols_dtype(["t", "t", "t", "t", "t", "t", "t", "t",
                                       "t", "t", "t"])
 
-                jail_list.insert(0, ["JID", "NAME", "BOOT", "STATE", "TYPE",
-                                     "RELEASE", "IP4", "IP6", "TEMPLATE",
-                                     "PORTAL", "DOC_URL"])
+                table.header(["JID", "NAME", "BOOT", "STATE", "TYPE", "RELEASE",
+                              "IP4", "IP6", "TEMPLATE", "PORTAL", "DOC_URL"])
             else:
                 # We get an infinite float otherwise.
                 table.set_cols_dtype(["t", "t", "t", "t", "t", "t", "t", "t",
                                       "t", "t"])
 
-                jail_list.insert(0, ["JID", "NAME", "BOOT", "STATE", "TYPE",
-                                     "RELEASE", "IP4", "IP6", "TEMPLATE",
-                                     'BASEJAIL'])
+                table.header(["JID", "NAME", "BOOT", "STATE", "TYPE", "RELEASE",
+                              "IP4", "IP6", "TEMPLATE", 'BASEJAIL'])
         else:
             # We get an infinite float otherwise.
             table.set_cols_dtype(["t", "t", "t", "t", "t"])
-            jail_list.insert(0, ["JID", "NAME", "STATE", "RELEASE", "IP4"])
+            table.header(["JID", "NAME", "STATE", "RELEASE", "IP4"])
 
-        table.add_rows(jail_list)
+        table.add_rows(jail_list, header=False)
 
         return table.draw()
 
@@ -474,8 +423,8 @@ class IOCList(object):
 
             return flat_base
 
-        base_list.insert(0, ["Bases fetched"])
-        table.add_rows(base_list)
+        table.header(["Bases fetched"])
+        table.add_rows(base_list, header=False)
         # We get an infinite float otherwise.
         table.set_cols_dtype(["t"])
 

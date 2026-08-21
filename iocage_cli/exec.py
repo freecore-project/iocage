@@ -40,7 +40,13 @@ __rootcmd__ = True
 @click.argument("command", nargs=-1, type=click.UNPROCESSED)
 @click.option('--force', '-f', default=False, is_flag=True,
               help='Start the jail if it\'s not running.')
-def cli(command, jail, host_user, jail_user, force):
+# the internal development record: long form only. Options iocage knows are parsed
+# even after the jail name, so a -p alias took the -p of `mkdir -p` and
+# other jail commands (13.3's exec has no -p).
+@click.option('--keep_proxy', default=False, is_flag=True,
+              help='Keep the host\'s proxy environment variables (http_proxy, '
+                   'HTTPS_PROXY, HTTP_PROXY_AUTH, NO_PROXY)')
+def cli(command, jail, host_user, jail_user, force, keep_proxy):
     """Runs the command given inside the specified jail as the supplied
     user."""
     # We may be getting ';', '&&' and so forth. Adding the shell for safety.
@@ -66,6 +72,7 @@ def cli(command, jail, host_user, jail_user, force):
             host_user,
             jail_user,
             interactive=True,
+            keep_proxy=keep_proxy,
             start_jail=force
         )
     except KeyboardInterrupt:
