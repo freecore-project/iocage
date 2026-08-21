@@ -34,6 +34,13 @@ import os
 from pathlib import Path
 
 
+def ignorable_jail_remove_stderr(stderr):
+    return all(
+        text in stderr
+        for text in ("allow.dying", "deprecated", "no effect")
+    )
+
+
 class IOCStop(object):
     """Stops a jail and unmounts the jails mountpoints."""
 
@@ -334,10 +341,12 @@ class IOCStop(object):
             stderr=su.PIPE if not debug_mode else None
         )
         _, stop_err = stop.communicate()
+        stop_err = stop_err.decode("utf-8") if stop_err else ""
+        stopped = not iocage_lib.ioc_list.IOCList().list_get_jid(self.uuid)[0]
 
-        if stop_err:
+        if stop_err and not (stopped and ignorable_jail_remove_stderr(stop_err)):
             msg = f'  + Removing jail process FAILED:\n' \
-                f'{stop_err.decode("utf-8")}'
+                f'{stop_err}'
             iocage_lib.ioc_common.logit({
                 'level': 'EXCEPTION',
                 'message': msg

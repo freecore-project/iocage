@@ -23,6 +23,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 """Common methods we reuse."""
 import collections
+from collections.abc import Iterable
 import contextlib
 import ipaddress
 import logging
@@ -79,10 +80,7 @@ def callback(_log, callback_exception):
         if not INTERACTIVE:
             raise callback_exception(message)
         else:
-            if not isinstance(message, str) and isinstance(
-                message,
-                collections.Iterable
-            ):
+            if not isinstance(message, str) and isinstance(message, Iterable):
                 message = '\n'.join(message)
 
             if not suppress_log:
@@ -119,6 +117,31 @@ def try_convert(value, default, *types):
             continue
 
     return default
+
+
+def parse_dhcp_address(ifconfig_output):
+    if isinstance(ifconfig_output, bytes):
+        ifconfig_output = ifconfig_output.decode('utf-8')
+
+    for line in ifconfig_output.splitlines():
+        fields = line.split()
+        if not fields or fields[0] != 'inet':
+            continue
+
+        try:
+            addr = fields[1]
+            netmask = fields[fields.index('netmask') + 1]
+        except (IndexError, ValueError):
+            break
+
+        if netmask.startswith('0x'):
+            mask_int = int(netmask, 16)
+        else:
+            mask_int = int(ipaddress.IPv4Address(netmask))
+
+        return addr, bin(mask_int).count('1')
+
+    raise ValueError('No IPv4 inet address found')
 
 
 def raise_sort_error(sort_list):
@@ -1106,17 +1129,25 @@ def get_host_gateways():
                       ['route-information']
                       ['route-table']
                       ['rt-family'])
-    for af in af_mapping.keys():
-        route_entries = list(filter(
-            lambda x: x['address-family'] == af, route_families)
-        )[0]['rt-entry']
+    if isinstance(route_families, dict):
+        route_families = [route_families]
+
+    for route_family in route_families:
+        af = af_mapping.get(route_family.get('address-family'))
+        if not af:
+            continue
+
+        route_entries = route_family.get('rt-entry') or []
+        if isinstance(route_entries, dict):
+            route_entries = [route_entries]
+
         default_route = list(filter(
             lambda x: x['destination'] == 'default', route_entries)
         )
         if default_route and 'gateway' in default_route[0]:
-            gateways[af_mapping[af]]['gateway'] = \
+            gateways[af]['gateway'] = \
                 default_route[0]['gateway']
-            gateways[af_mapping[af]]['interface'] = \
+            gateways[af]['interface'] = \
                 default_route[0]['interface-name']
     return gateways
 
@@ -1167,7 +1198,7 @@ def retrieve_ip4_for_jail(conf, jail_running):
     if iocage_lib.ioc_common.check_truthy(conf['dhcp']) and jail_running and os.geteuid() == 0:
         interface = conf['interfaces'].split(',')[0].split(':')[0]
 
-        if interface == 'vnet0':
+        if 'vnet' in interface:
             # Inside jails they are epairNb
             interface = f"{interface.replace('vnet', 'epair')}b"
 
@@ -1178,8 +1209,9 @@ def retrieve_ip4_for_jail(conf, jail_running):
         ]
         try:
             out = su.check_output(full_ip4_cmd)
-            full_ip4 = f'{interface}|{out.splitlines()[2].split()[1].decode()}'
-        except (su.CalledProcessError, IndexError) as e:
+            addr, _ = parse_dhcp_address(out)
+            full_ip4 = f'{interface}|{addr}'
+        except (su.CalledProcessError, ValueError) as e:
             short_ip4 += '(Network Issue)'
             if isinstance(e, su.CalledProcessError):
                 full_ip4 = f'DHCP - Network Issue: {e}'

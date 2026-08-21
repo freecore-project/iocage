@@ -57,7 +57,6 @@ setup(
         'netifaces>=0.10.8',
         'dnspython>=1.15.0',
     ],
-    setup_requires=['pytest-runner'],
     entry_points={'console_scripts': ['iocage = iocage_lib:cli']},
     data_files=_data,
     tests_require=['pytest', 'pytest-cov', 'pytest-pep8']
