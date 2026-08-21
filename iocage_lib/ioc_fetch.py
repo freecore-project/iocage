@@ -51,6 +51,17 @@ from iocage_lib.dataset import Dataset
 tarfile.tar_filter
 
 
+def _release_archive_filter(member, dest_path):
+    """Apply tar path protections without changing the release file mode."""
+    original_mode = member.mode
+    member = tarfile.tar_filter(member, dest_path)
+
+    if member is not None and member.mode != original_mode:
+        member = member.replace(mode=original_mode, deep=False)
+
+    return member
+
+
 class IOCFetch:
 
     """Fetch a RELEASE for use as a jail base."""
@@ -821,7 +832,9 @@ class IOCFetch:
             # removing them first.
             member = self.__fetch_extract_remove__(f)
             member = self.__fetch_check_members__(member)
-            f.extractall(dest, members=member, filter='tar')
+            f.extractall(
+                dest, members=member, filter=_release_archive_filter
+            )
 
     def fetch_update(self, cli=False, uuid=None):
         """This calls 'freebsd-update' to update the fetched RELEASE."""

@@ -26,6 +26,42 @@ import pytest
 import iocage_lib.ioc_start as ioc_start
 
 
+@pytest.mark.parametrize('ifconfig_output,expected', [
+    ("""epair0b: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
+        description: jail side interface
+        options=8<VLAN_MTU>
+        inet 192.0.2.10 netmask 0xffffff00 broadcast 192.0.2.255
+        groups: epair
+""", ('192.0.2.10', 24)),
+    ("""epair0b: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
+        inet 198.51.100.12 netmask 255.255.255.128 broadcast 198.51.100.127
+""", ('198.51.100.12', 25)),
+])
+def test_parse_dhcp_address_from_ifconfig_inet(ifconfig_output, expected):
+    assert ioc_start.parse_dhcp_address(ifconfig_output.encode()) == expected
+
+
+def test_parse_dhcp_address_raises_without_inet():
+    with pytest.raises(ValueError):
+        ioc_start.parse_dhcp_address(
+            b'epair0b: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>\n'
+        )
+
+
+def test_find_vnet_default_route_interface_matches_configured_address():
+    assert ioc_start.find_vnet_default_route_interface(
+        ['vnet0:bridge0', 'vnet1:bridge1'],
+        'vnet1|2001:db8::10/64',
+    ) == 'vnet1'
+
+
+def test_find_vnet_default_route_interface_falls_back_to_vnet0():
+    assert ioc_start.find_vnet_default_route_interface(
+        ['vnet2:bridge2'],
+        '2001:db8::10/64',
+    ) == 'vnet0'
+
+
 @mock.patch('iocage_lib.ioc_common.checkoutput')
 def test_should_return_mtu_of_first_member(mock_checkoutput):
     mock_checkoutput.side_effect = [bridge_if_config, member_if_config]
@@ -63,7 +99,7 @@ def test_should_return_default_mtu_if_no_members(mock_checkoutput):
     iocs.get = _mock_iocstart_get
     mtu = iocs.find_bridge_mtu('bridge0')
     assert mtu == '1500'
-    mock_checkoutput.called_with(["ifconfig", "bridge0"])
+    mock_checkoutput.assert_called_with(["ifconfig", "bridge0"])
 
 
 @mock.patch('iocage_lib.ioc_common.logit')
@@ -139,6 +175,59 @@ def test_should_return_default_gateway(test_input, expected):
     assert iocstart.get_default_gateway() == expected['ipv4']
     assert iocstart.get_default_gateway('ipv4') == expected['ipv4']
     assert iocstart.get_default_gateway('ipv6') == expected['ipv6']
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+def test_start_network_vnet_addr_configures_static_ipv6_with_ipv4_dhcp(mock_checkoutput):
+    iocstart = ioc_start.IOCStart("", "", unit_test=True)
+    iocstart.exec_fib = '0'
+    iocstart.ip4_addr = 'DHCP'
+    iocstart.uuid = 'dhcpv6'
+    iocstart.get = lambda prop: 1 if prop == 'dhcp' else None
+
+    assert iocstart.start_network_vnet_addr(
+        'vnet0', '2001:db8::10/64', 'none', ipv6=True
+    ) is None
+    mock_checkoutput.assert_called_once_with([
+        'setfib', '0', 'jexec', 'ioc-dhcpv6',
+        'ifconfig', 'epair0b', 'inet6', '2001:db8::10/64', 'up'
+    ], stderr=ioc_start.su.STDOUT)
+
+
+@mock.patch('iocage_lib.ioc_common.checkoutput')
+@mock.patch('iocage_lib.ioc_start.su.Popen')
+def test_start_network_vnet_iface_disables_jail_epair_tx_checksum_offload(
+        mock_popen, mock_checkoutput):
+    process = mock.Mock()
+    process.communicate.return_value = (b'epair0a\n',)
+    mock_popen.return_value = process
+
+    iocstart = ioc_start.IOCStart("", "", unit_test=True)
+    iocstart.exec_fib = '0'
+    iocstart.ip6_addr = 'none'
+    iocstart.uuid = 'testnat'
+    iocstart.get = lambda prop: {
+        'vnet_default_interface': 'em0',
+        'vnet1_mac': '020000000001 020000000002',
+    }[prop]
+
+    assert iocstart.start_network_vnet_iface(
+        'vnet1', 'bridge0', '1500', '3', nat_addr='192.0.2.1'
+    ) is None
+    mock_checkoutput.assert_has_calls([
+        mock.call([
+            'setfib', '0', 'jexec', 'ioc-testnat',
+            'ifconfig', 'epair0b', 'name', 'epair1b'
+        ], stderr=ioc_start.su.STDOUT),
+        mock.call([
+            'setfib', '0', 'jexec', 'ioc-testnat',
+            'ifconfig', 'epair1b', 'link', '020000000002'
+        ], stderr=ioc_start.su.STDOUT),
+        mock.call([
+            'setfib', '0', 'jexec', 'ioc-testnat',
+            'ifconfig', 'epair1b', '-txcsum', '-txcsum6'
+        ], stderr=ioc_start.su.STDOUT),
+    ])
 
 
 bridge_if_config = """bridge0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
