@@ -34,6 +34,7 @@ import shutil
 import string
 import subprocess as su
 import sys
+import urllib.parse
 
 import iocage_lib.ioc_common
 import iocage_lib.ioc_create
@@ -49,6 +50,77 @@ import pathlib
 from iocage_lib.dataset import Dataset
 from iocage_lib.pools import PoolListableResource, Pool
 from iocage_lib.snapshot import Snapshot
+
+
+# the internal development record: the FreeCORE plugin catalog the 15.0 plugin store uses
+# (the internal development record #18), carried onto 1.13 from the fork.
+OFFICIAL_PLUGIN_REPOSITORY = (
+    'https://plugins.freecore.org/plugins/git/'
+    'iocage-freecore-plugins.git'
+)
+LEGACY_IX_PLUGIN_REPOSITORY_PATHS = (
+    '/freenas/iocage-ix-plugins',
+    '/truenas/iocage-ix-plugins',
+    '/ix-plugin-hub/iocage-plugin-index',
+)
+RETIRED_FREECORE_PLUGIN_REPOSITORY_PATHS = (
+    '/plugins/git/iocage-zfs-plugins',
+    '/plugins/iocage-zfs-plugins',
+    '/truenas/iocage-zfs-plugins',
+)
+LEGACY_IX_PLUGIN_CREATION_ERROR = (
+    'New plugin jails cannot be created from a retired TrueNAS 13.3 '
+    'catalog. Choose the FreeCORE plugin catalog. Existing plugin jails '
+    'keep their stored repository for compatibility.'
+)
+
+
+def plugin_repository_path(repository):
+    repository = repository or ''
+    parsed = urllib.parse.urlparse(repository)
+    path = parsed.path
+
+    # urlparse treats the path in an SCP-style Git URL as part of the
+    # scheme-less string. Accept that common form as well as normal URLs.
+    if not parsed.scheme and ':' in repository:
+        path = repository.split(':', 1)[1]
+
+    path = f'/{path.lstrip("/")}'.rstrip('/')
+    return path[:-4] if path.endswith('.git') else path
+
+
+def legacy_ix_plugin_repository(repository):
+    path = plugin_repository_path(repository)
+    return path in LEGACY_IX_PLUGIN_REPOSITORY_PATHS
+
+
+def validate_plugin_repository_for_creation(
+    repository, callback=None, silent=False
+):
+    if legacy_ix_plugin_repository(repository):
+        iocage_lib.ioc_common.logit(
+            {
+                'level': 'EXCEPTION',
+                'message': LEGACY_IX_PLUGIN_CREATION_ERROR
+            },
+            _callback=callback,
+            silent=silent
+        )
+
+
+def retired_freecore_plugin_repository(repository):
+    path = plugin_repository_path(repository)
+    return path in RETIRED_FREECORE_PLUGIN_REPOSITORY_PATHS
+
+
+def normalize_plugin_repository(repository):
+    if (
+        not repository or repository == 'none' or
+        retired_freecore_plugin_repository(repository)
+    ):
+        return OFFICIAL_PLUGIN_REPOSITORY
+
+    return repository
 
 
 class JailRuntimeConfiguration(object):
@@ -184,8 +256,8 @@ class IOCCpuset(object):
             )
         except iocage_lib.ioc_exceptions.CommandFailed:
             failed = True
-        finally:
-            return failed
+
+        return failed
 
     @staticmethod
     def retrieve_cpu_sets():
@@ -199,13 +271,13 @@ class IOCCpuset(object):
             pass
         else:
             result = re.findall(
-                r'.*mask:.*(\d+)$',
+                r'.*mask:.*?(\d+)$',
                 output.stdout.split('\n')[0]
             )
             if result:
                 cpu_sets = int(result[0])
-        finally:
-            return cpu_sets
+
+        return cpu_sets
 
     @staticmethod
     def validate_cpuset_prop(value, raise_error=True):
@@ -329,8 +401,8 @@ class IOCRCTL(object):
             if f'jail:{self.jail_name}{"" if not prop else f":{prop}"}' \
                     in output.stdout:
                 rctl_enabled = True
-        finally:
-            return rctl_enabled
+
+        return rctl_enabled
 
     @staticmethod
     def validate_rctl_tunable():
@@ -434,7 +506,7 @@ class IOCConfiguration:
     @staticmethod
     def get_version():
         """Sets the iocage configuration version."""
-        version = '28'
+        version = '34'
 
         return version
 
@@ -449,7 +521,10 @@ class IOCConfiguration:
             # iocage skip is false
             old = False
             matches = []
-            zpools = [pool for pool in PoolListableResource() if not pool.root_dataset.locked]
+            zpools = [
+                pool for pool in PoolListableResource()
+                if not pool.root_dataset.locked
+            ]
             for pool in zpools:
                 if pool.active:
                     matches.append(pool)
@@ -688,9 +763,10 @@ class IOCConfiguration:
                 conf[p] = 1 if iocage_lib.ioc_common.check_truthy(v) else 0
 
         if conf.get('type') in ('plugin', 'pluginv2'):
-            official_repo = 'https://github.com/freenas/iocage-ix-plugins.git'
-            if conf.get('plugin_repository', 'none') == 'none':
-                conf['plugin_repository'] = official_repo
+            plugin_repository = conf.get('plugin_repository', 'none')
+            conf['plugin_repository'] = normalize_plugin_repository(
+                plugin_repository
+            )
 
             if conf.get('plugin_name', 'none') == 'none':
                 jail_path = os.path.join(
@@ -733,17 +809,6 @@ class IOCConfiguration:
                 'plugin_name', 'none'
             ) == 'none':
                 conf['plugin_name'] = conf['host_hostuuid'].rsplit('_', 1)[0]
-
-            if conf['plugin_name'] in (
-                'channels-dvr', 'dnsmasq', 'homebridge', 'irssi', 'madsonic',
-                'openvpn', 'quasselcore', 'rtorrent-flood', 'sickchill',
-                'unificontroller', 'unificontroller-lts', 'weechat', 'xmrig',
-                'radarr', 'sonarr', 'backuppc', 'clamav', 'couchpotato', 'emby',
-                'jenkins', 'jenkins-lts', 'mineos', 'transmission', 'tautulli',
-                'qbittorrent', 'zoneminder',
-            ) and conf['plugin_repository'] in official_repo:
-                conf['plugin_repository'] = \
-                    'https://github.com/ix-plugin-hub/iocage-plugin-index.git'
 
         return True if original_conf != conf else False
 
@@ -823,7 +888,9 @@ class IOCConfiguration:
         if not conf.get('allow_mlock'):
             conf['allow_mlock'] = 0
 
-        # Version 13 keys
+        # Version 13 keys. FreeCORE retains the inherited TrueNAS automatic
+        # interface selection for ordinary installations. An explicit value,
+        # including "none", is preserved.
         if not conf.get('vnet_default_interface'):
             conf['vnet_default_interface'] = 'auto'
         else:
@@ -908,6 +975,29 @@ class IOCConfiguration:
         if not conf.get("vnet_default_mtu"):
             conf["vnet_default_mtu"] = '1500'
 
+        # Version 29 key
+        if not conf.get('allow_mount_fdescfs'):
+            conf['allow_mount_fdescfs'] = 0
+
+        # Version 30 key
+        if not conf.get('allow_mount_linprocfs'):
+            conf['allow_mount_linprocfs'] = 0
+
+        # Version 31 key
+        if not conf.get('allow_nfsd'):
+            conf['allow_nfsd'] = 0
+
+        # Version 32 key
+        if not conf.get('allow_mount_linsysfs'):
+            conf['allow_mount_linsysfs'] = 0
+
+        # FreeCORE keeps the TrueNAS 13.3 product defaults while adopting the
+        # newer configuration schema. Do not rewrite explicit values.
+        if 'host_domainname' not in conf:
+            conf['host_domainname'] = 'none'
+        if 'compression' not in conf:
+            conf['compression'] = 'lz4'
+
         if not default:
             conf.update(jail_conf)
 
@@ -960,7 +1050,7 @@ class IOCConfiguration:
             # the best case here is to parse fstab entries and determine
             # which release is being used and check it for freebsd-version
             fstab = iocage_lib.ioc_fstab.IOCFstab(host_hostuuid, 'list')
-            fstab.__validate_fstab__([l[1] for l in fstab.fstab], 'all')
+            fstab.__validate_fstab__([i[1] for i in fstab.fstab], 'all')
             for index, fstab_entry in fstab.fstab_list():
                 if fstab_entry[1].rstrip('/') == os.path.join(
                     freebsd_version_path, 'bin'
@@ -1164,15 +1254,19 @@ class IOCConfiguration:
             'allow_mlock': 0,
             'allow_mount': 0,
             'allow_mount_devfs': 0,
+            'allow_mount_fdescfs': 0,
             'allow_mount_fusefs': 0,
             'allow_mount_nullfs': 0,
             'allow_mount_procfs': 0,
+            'allow_mount_linprocfs': 0,
+            'allow_mount_linsysfs': 0,
             'allow_mount_tmpfs': 0,
             'allow_mount_zfs': 0,
             'allow_quotas': 0,
             'allow_socket_af': 0,
             'allow_tun': 0,
             'allow_vmm': 0,
+            'allow_nfsd': 0,
             'cpuset': 'off',
             'rlimits': 'off',
             'memoryuse': 'off',
@@ -1336,12 +1430,16 @@ class IOCJson(IOCConfiguration):
         'allow_mount_nullfs',
         'allow_mount_fusefs',
         'allow_mount_devfs',
+        'allow_mount_fdescfs',
+        'allow_mount_linprocfs',
+        'allow_mount_linsysfs',
         'allow_mount',
         'allow_mlock',
         'allow_chflags',
         'allow_raw_sockets',
         'allow_sysvipc',
         'allow_set_hostname',
+        'allow_nfsd',
         'mount_fdescfs',
         'mount_devfs',
         'ip6_saddrsel',
@@ -1433,7 +1531,7 @@ class IOCJson(IOCConfiguration):
         # Filter the props we want to convert.
         prop_prefix = "org.freebsd.iocage"
 
-        key_and_value = {"host_domainname": "none"}
+        key_and_value = {"host_domainname": ""}
 
         for key, prop in props.items():
 
@@ -1537,7 +1635,7 @@ class IOCJson(IOCConfiguration):
                     iocage_lib.ioc_common.logit(
                         {
                             'level': 'EXCEPTION',
-                            'message': f'{jail_uuid} is missing it\'s'
+                            'message': f'{jail_uuid} is missing its'
                             ' configuration, please destroy this jail and'
                             ' recreate it.',
                             'suppress_log': self.suppress_log
@@ -1991,9 +2089,14 @@ class IOCJson(IOCConfiguration):
 
                             return
 
-                        iocage_lib.ioc_common.checkoutput(
-                            ["jail", "-m", f"jid={jid}", f"{key}={value}"],
-                            stderr=su.STDOUT)
+                        if key == "cpuset":
+                            iocage_lib.ioc_common.checkoutput(
+                                ["cpuset", "-l", f"{value}", "-j", f"{jid}"],
+                                stderr=su.STDOUT)
+                        else:
+                            iocage_lib.ioc_common.checkoutput(
+                                ["jail", "-m", f"jid={jid}", f"{key}={value}"],
+                                stderr=su.STDOUT)
                     except su.CalledProcessError as err:
                         raise RuntimeError(
                             f"{err.output.decode('utf-8').rstrip()}")
@@ -2083,14 +2186,18 @@ class IOCJson(IOCConfiguration):
             "allow_mlock": truth_variations,
             "allow_mount": truth_variations,
             "allow_mount_devfs": truth_variations,
+            "allow_mount_fdescfs": truth_variations,
             "allow_mount_fusefs": truth_variations,
             "allow_mount_nullfs": truth_variations,
             "allow_mount_procfs": truth_variations,
+            "allow_mount_linprocfs": truth_variations,
+            "allow_mount_linsysfs": truth_variations,
             "allow_mount_tmpfs": truth_variations,
             "allow_mount_zfs": truth_variations,
             "allow_quotas": truth_variations,
             "allow_socket_af": truth_variations,
             "allow_vmm": truth_variations,
+            "allow_nfsd": truth_variations,
             "vnet_interfaces": ("string", ),
             # RCTL limits
             "cpuset": ('string',),
