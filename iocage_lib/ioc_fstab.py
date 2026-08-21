@@ -203,7 +203,9 @@ class IOCFstab(object):
         # `actions` specify on which `action` to raise validation error
         dests = OrderedDict()
         verrors = []
-        jail_root = self.__fstab_encode__(f'{self.iocroot}/jails/{self.uuid}/root')
+        jail_root = self.__fstab_encode__(
+            f'{self.iocroot}/jails/{self.uuid}/root'
+        )
 
         for index, line in enumerate(fstab):
             # Comment
@@ -543,9 +545,8 @@ class IOCFstab(object):
 
         # We get an infinite float otherwise.
         table.set_cols_dtype(["t", "t"])
-        flat_fstab.insert(0, ["INDEX", "FSTAB ENTRY"])
-
-        table.add_rows(flat_fstab)
+        table.header(["INDEX", "FSTAB ENTRY"])
+        table.add_rows(flat_fstab, header=False)
 
         return table.draw()
 
