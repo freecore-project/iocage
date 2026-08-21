@@ -24,6 +24,7 @@
 """fetch module for the cli."""
 import click
 import iocage_lib.ioc_common as ioc_common
+import iocage_lib.ioc_plugin as ioc_plugin
 import iocage_lib.iocage as ioc
 import os
 
@@ -152,6 +153,9 @@ def validate_count(ctx, param, value):
 )
 def cli(**kwargs):
     """CLI command that calls fetch_release()"""
+    if kwargs.get('plugins') or kwargs.get('plugin_name'):
+        ioc_plugin.reject_remote_plugin_operation()
+
     release = kwargs.get("release", None)
     _file = kwargs.get("_file", False)
 
