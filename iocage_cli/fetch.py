@@ -24,6 +24,7 @@
 """fetch module for the cli."""
 import click
 import iocage_lib.ioc_common as ioc_common
+import iocage_lib.ioc_json as ioc_json
 import iocage_lib.iocage as ioc
 import os
 
@@ -71,7 +72,7 @@ def validate_count(ctx, param, value):
 )
 @click.option(
     '--git_repository', '-g',
-    default='https://github.com/freenas/iocage-ix-plugins.git',
+    default=ioc_json.OFFICIAL_PLUGIN_REPOSITORY,
     help='Git repository to use to fetch plugin.'
 )
 @click.option(

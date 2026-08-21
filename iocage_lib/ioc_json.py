@@ -34,6 +34,7 @@ import shutil
 import string
 import subprocess as su
 import sys
+import urllib.parse
 
 import iocage_lib.ioc_common
 import iocage_lib.ioc_create
@@ -49,6 +50,75 @@ import pathlib
 from iocage_lib.dataset import Dataset
 from iocage_lib.pools import PoolListableResource, Pool
 from iocage_lib.snapshot import Snapshot
+
+
+OFFICIAL_PLUGIN_REPOSITORY = (
+    'https://plugins.freecore.org/plugins/git/'
+    'iocage-freecore-plugins.git'
+)
+LEGACY_IX_PLUGIN_REPOSITORY_PATHS = (
+    '/freenas/iocage-ix-plugins',
+    '/truenas/iocage-ix-plugins',
+    '/ix-plugin-hub/iocage-plugin-index',
+)
+RETIRED_FREECORE_PLUGIN_REPOSITORY_PATHS = (
+    '/plugins/git/iocage-zfs-plugins',
+    '/plugins/iocage-zfs-plugins',
+    '/truenas/iocage-zfs-plugins',
+)
+LEGACY_IX_PLUGIN_CREATION_ERROR = (
+    'New plugin jails cannot be created from a retired TrueNAS 13.3 '
+    'catalog. Choose the FreeCORE plugin catalog. Existing plugin jails '
+    'keep their stored repository for compatibility.'
+)
+
+
+def plugin_repository_path(repository):
+    repository = repository or ''
+    parsed = urllib.parse.urlparse(repository)
+    path = parsed.path
+
+    # urlparse treats the path in an SCP-style Git URL as part of the
+    # scheme-less string. Accept that common form as well as normal URLs.
+    if not parsed.scheme and ':' in repository:
+        path = repository.split(':', 1)[1]
+
+    path = f'/{path.lstrip("/")}'.rstrip('/')
+    return path[:-4] if path.endswith('.git') else path
+
+
+def legacy_ix_plugin_repository(repository):
+    path = plugin_repository_path(repository)
+    return path in LEGACY_IX_PLUGIN_REPOSITORY_PATHS
+
+
+def validate_plugin_repository_for_creation(
+    repository, callback=None, silent=False
+):
+    if legacy_ix_plugin_repository(repository):
+        iocage_lib.ioc_common.logit(
+            {
+                'level': 'EXCEPTION',
+                'message': LEGACY_IX_PLUGIN_CREATION_ERROR
+            },
+            _callback=callback,
+            silent=silent
+        )
+
+
+def retired_freecore_plugin_repository(repository):
+    path = plugin_repository_path(repository)
+    return path in RETIRED_FREECORE_PLUGIN_REPOSITORY_PATHS
+
+
+def normalize_plugin_repository(repository):
+    if (
+        not repository or repository == 'none' or
+        retired_freecore_plugin_repository(repository)
+    ):
+        return OFFICIAL_PLUGIN_REPOSITORY
+
+    return repository
 
 
 class JailRuntimeConfiguration(object):
@@ -184,8 +254,8 @@ class IOCCpuset(object):
             )
         except iocage_lib.ioc_exceptions.CommandFailed:
             failed = True
-        finally:
-            return failed
+
+        return failed
 
     @staticmethod
     def retrieve_cpu_sets():
@@ -204,8 +274,8 @@ class IOCCpuset(object):
             )
             if result:
                 cpu_sets = int(result[0])
-        finally:
-            return cpu_sets
+
+        return cpu_sets
 
     @staticmethod
     def validate_cpuset_prop(value, raise_error=True):
@@ -329,8 +399,8 @@ class IOCRCTL(object):
             if f'jail:{self.jail_name}{"" if not prop else f":{prop}"}' \
                     in output.stdout:
                 rctl_enabled = True
-        finally:
-            return rctl_enabled
+
+        return rctl_enabled
 
     @staticmethod
     def validate_rctl_tunable():
@@ -688,9 +758,10 @@ class IOCConfiguration:
                 conf[p] = 1 if iocage_lib.ioc_common.check_truthy(v) else 0
 
         if conf.get('type') in ('plugin', 'pluginv2'):
-            official_repo = 'https://github.com/freenas/iocage-ix-plugins.git'
-            if conf.get('plugin_repository', 'none') == 'none':
-                conf['plugin_repository'] = official_repo
+            plugin_repository = conf.get('plugin_repository', 'none')
+            conf['plugin_repository'] = normalize_plugin_repository(
+                plugin_repository
+            )
 
             if conf.get('plugin_name', 'none') == 'none':
                 jail_path = os.path.join(
@@ -733,17 +804,6 @@ class IOCConfiguration:
                 'plugin_name', 'none'
             ) == 'none':
                 conf['plugin_name'] = conf['host_hostuuid'].rsplit('_', 1)[0]
-
-            if conf['plugin_name'] in (
-                'channels-dvr', 'dnsmasq', 'homebridge', 'irssi', 'madsonic',
-                'openvpn', 'quasselcore', 'rtorrent-flood', 'sickchill',
-                'unificontroller', 'unificontroller-lts', 'weechat', 'xmrig',
-                'radarr', 'sonarr', 'backuppc', 'clamav', 'couchpotato', 'emby',
-                'jenkins', 'jenkins-lts', 'mineos', 'transmission', 'tautulli',
-                'qbittorrent', 'zoneminder',
-            ) and conf['plugin_repository'] in official_repo:
-                conf['plugin_repository'] = \
-                    'https://github.com/ix-plugin-hub/iocage-plugin-index.git'
 
         return True if original_conf != conf else False
 
