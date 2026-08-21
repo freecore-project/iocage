@@ -1,12 +1,12 @@
 # iocage
 
-[![Average time to resolve an issue](http://isitmaintained.com/badge/resolution/iocage/iocage.svg)](http://isitmaintained.com/project/iocage/iocage "Average time to resolve an issue")
-[![Percentage of issues still open](http://isitmaintained.com/badge/open/iocage/iocage.svg)](http://isitmaintained.com/project/iocage/iocage "Percentage of issues still open")
-![Python Version](https://img.shields.io/badge/Python-3.6-blue.svg)
-[![GitHub issues](https://img.shields.io/github/issues/iocage/iocage.svg)](https://github.com/iocage/iocage/issues)
-[![GitHub forks](https://img.shields.io/github/forks/iocage/iocage.svg)](https://github.com/iocage/iocage/network)
-[![GitHub stars](https://img.shields.io/github/stars/iocage/iocage.svg)](https://github.com/iocage/iocage/stargazers)
-[![Twitter](https://img.shields.io/twitter/url/https/github.com/iocage/iocage.svg?style=social)](https://twitter.com/intent/tweet?text=@iocage)
+[![Average time to resolve an issue](http://isitmaintained.com/badge/resolution/freebsd/iocage.svg)](http://isitmaintained.com/project/freebsd/iocage "Average time to resolve an issue")
+[![Percentage of issues still open](http://isitmaintained.com/badge/open/freebsd/iocage.svg)](http://isitmaintained.com/project/freebsd/iocage "Percentage of issues still open")
+![Python Version](https://img.shields.io/badge/Python-3.11-blue.svg)
+[![GitHub issues](https://img.shields.io/github/issues/freebsd/iocage.svg)](https://github.com/freebsd/iocage/issues)
+[![GitHub forks](https://img.shields.io/github/forks/freebsd/iocage.svg)](https://github.com/freebsd/iocage/network)
+[![GitHub stars](https://img.shields.io/github/stars/freebsd/iocage.svg)](https://github.com/freebsd/iocage/stargazers)
+[![Twitter](https://img.shields.io/twitter/url/https/github.com/freebsd/iocage.svg?style=social)](https://twitter.com/intent/tweet?text=@iocage)
 
 ## A FreeBSD jail manager
 
@@ -15,7 +15,7 @@ technologies the FreeBSD operating system has to offer. It is geared for ease
  of use with a simple and easy to understand command syntax.
 
 iocage is in the FreeBSD ports tree as sysutils/py-iocage.
-To install using binary packages, simply run: `pkg install py36-iocage`
+To install using binary packages, simply run: `pkg install sysutils/iocage`
 
 ## Installation
 
@@ -23,8 +23,8 @@ To install using binary packages, simply run: `pkg install py36-iocage`
 
 The FreeBSD source tree ***must*** be located at `$SRC_BASE` (`/usr/src` by default) to build from git.
 
-- `pkg install python36 git-lite py36-cython py36-pip`
-- `git clone --recursive https://github.com/iocage/iocage`
+- `pkg install python3 git-lite lang/cython3 devel/py-pip`
+- `git clone https://github.com/freebsd/iocage`
 - `make install` as root
 
 To install subsequent updates: run `make install` as root.
@@ -35,7 +35,7 @@ To install subsequent updates: run `make install` as root.
 
 ### Pkg:
 
-- It is possible to install pre-built packages using pkg(8) if you are using FreeBSD 10 or above: `pkg install py36-iocage`
+- It is possible to install pre-built packages using pkg(8) if you are using FreeBSD 10 or above: `pkg install sysutils/iocage`
 
 #### Upgrading from `iocage_legacy`:
 
@@ -50,16 +50,14 @@ This repository replaces `iocage_legacy`. To upgrade to the current version:
 
 ## Links
 
-- **[iocage Project Website](https://iocage.github.io/)**
-- **[Documentation](http://iocage.readthedocs.org/en/latest/index.html)**
-- **[Mailing list](https://groups.google.com/forum/#!forum/iocage)**
+- **[iocage Project Website](https://freebsd.github.io/iocage/)**
 
 ## WARNING:
 - Some features of the previous iocage_legacy are either being dropped or simply not ported yet, feel free to open an issue asking about your favorite feature. But please search before opening a new one. PR's welcome for any feature you want!
 
 ## Raising an issue:
 
-We _like_ issues! If you are having trouble with `iocage` please open a GitHub [issue](https://github.com/iocage/iocage/issues) and we will ~~run around with our hair on fire~~ look into it. Before doing so, please give us some information about the situation:
+We _like_ issues! If you are having trouble with `iocage` please open a GitHub [issue](https://github.com/freebsd/iocage/issues) and we will ~~run around with our hair on fire~~ look into it. Before doing so, please give us some information about the situation:
 
 - Tell us what version of FreeBSD you are using with something like `uname -ro`
 - It would also be helpful if you gave us the output of `iocage --version`
@@ -120,9 +118,9 @@ To see a list of commands available to you now, type `iocage` outside the jail.
 
 ### REQUIREMENTS
 
-- FreeBSD 9.3-RELEASE amd64 and higher or HardenedBSD/TrueOS
+- FreeBSD 11.4-RELEASE amd64 and higher or HardenedBSD/TrueOS
 - ZFS file system
-- Python 3.6+
+- Python 3.8+
 - UTF-8 locale (place into your ~/.login_conf):
 
 ```plain
@@ -157,6 +155,3 @@ me:\
         net.link.bridge.pfil_onlyip=0  # Only pass IP packets when pfil is enabled
         net.link.bridge.pfil_bridge=0  # Packet filter on the bridge interface
         net.link.bridge.pfil_member=0  # Packet filter on the member interface
-- Lots of jails or a big server? Mount `fdescfs`:
-
-        mount -t fdescfs null /dev/fd
