@@ -22,17 +22,14 @@
 # IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 """Exception classes for iocage"""
-import collections
+from collections.abc import Iterable
 from contextlib import contextmanager
 
 
 class ExceptionWithMsg(Exception):
     """message attribute will be an iterable if a message is supplied"""
     def __init__(self, message):
-        if not isinstance(message, str) and not isinstance(
-            message,
-            collections.Iterable
-        ):
+        if not isinstance(message, str) and not isinstance(message, Iterable):
             message = [message]
 
         self.message = message

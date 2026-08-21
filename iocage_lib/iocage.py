@@ -994,6 +994,15 @@ class IOCage:
         keep_jail_on_failure = kwargs.pop("keep_jail_on_failure", False)
         thick_config = kwargs.pop("thickconfig", False)
 
+        if plugins or plugin_name:
+            kwargs['git_repository'] = ioc_json.normalize_plugin_repository(
+                kwargs.get('git_repository')
+            )
+            if not _list:
+                ioc_json.validate_plugin_repository_for_creation(
+                    kwargs['git_repository'], self.callback, self.silent
+                )
+
         freebsd_version = ioc_common.checkoutput(["freebsd-version"])
         arch = os.uname()[4]
 
@@ -1037,8 +1046,12 @@ class IOCage:
             if plugins:
                 ioc_plugin.IOCPlugin(
                     release=release,
+                    jail=name,
                     plugin=plugin_name,
                     branch=branch,
+                    silent=self.silent,
+                    keep_jail_on_failure=keep_jail_on_failure,
+                    callback=self.callback,
                     thickconfig=thick_config,
                     **kwargs).fetch_plugin_index(
                         props, accept_license=accept, official=official)
