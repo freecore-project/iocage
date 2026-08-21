@@ -30,8 +30,8 @@ import iocage_lib.iocage as ioc
 
 
 @click.command(name="snaplist", help="Show snapshots of a specified jail.")
-@click.option("--header", "-h", "-H", is_flag=True, default=True,
-              help="For scripting, use tabs for separators.")
+@click.option("--header", "-h", "-H", is_flag=True, default=not ioc.CLICK_WORKAROUND,
+              help="For scripting, no headers and tabs as separators.")
 @click.option("--long", "-l", "_long", is_flag=True, default=False,
               help="Show the full dataset path for snapshot name.")
 @click.option("--sort", "-s", "_sort", default="created", nargs=1,
@@ -39,14 +39,22 @@ import iocage_lib.iocage as ioc
 @click.argument("jail")
 def cli(header, jail, _long, _sort):
     """Allows a user to show resource usage of all jails."""
+
+    if ioc.CLICK_WORKAROUND:
+        header = not header
     table = texttable.Texttable(max_width=0)
     snap_list = ioc.IOCage(jail=jail).snap_list(_long, _sort)
 
     if header:
-        snap_list.insert(0, ["NAME", "CREATED", "RSIZE", "USED"])
+        if jail == 'ALL':
+            cols = ["JAIL"]
+        else:
+            cols = []
+        cols.extend(["NAME", "CREATED", "RSIZE", "USED"])
+        table.header(cols)
         # We get an infinite float otherwise.
-        table.set_cols_dtype(["t", "t", "t", "t"])
-        table.add_rows(snap_list)
+        table.set_cols_dtype(["t"] * len(cols))
+        table.add_rows(snap_list, header=False)
         ioc_common.logit({
             "level"  : "INFO",
             "message": table.draw()
