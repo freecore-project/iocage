@@ -53,6 +53,13 @@ from iocage_lib.release import Release
 from iocage_lib.snapshot import SnapshotListableResource, Snapshot
 
 
+# Workaround for click bugs and incompatible changes introduced
+# in 8.2.x. Once we can upgrade to click 8.4.1, this and all
+# its consumers can be removed, but places using the workaround
+# need to be changed to use flag_value=False instead of
+# is_flag=True (and change default to True).
+CLICK_WORKAROUND=True
+
 class PoolAndDataset:
 
     def get_pool(self):
@@ -125,7 +132,7 @@ class IOCage:
                 self.stop(j, ignore_exception=ignore_exception)
             elif action == 'start':
                 if not status:
-                    err, msg = self.start(j, ignore_exception=ignore_exception)
+                    err, msg = self.start(j, ignore_exception=True)
 
                     if err:
                         ioc_common.logit(
@@ -251,6 +258,18 @@ class IOCage:
         Return:
                 tuple: The jails uuid, path
         """
+
+        if '/' in self.jail:
+            msg = f"jail '{self.jail}' not found ('/' not allowed in jail name)!"
+
+            ioc_common.logit(
+                {
+                    "level": "EXCEPTION",
+                    "message": msg
+                },
+                _callback=self.callback,
+                silent=self.silent)
+            return
 
         if os.path.isdir(f"{self.iocroot}/jails/{self.jail}"):
             path = f"{self.iocroot}/jails/{self.jail}"
@@ -537,7 +556,7 @@ class IOCage:
 
             arch = os.uname()[4]
 
-            if arch == 'arm64':
+            if arch in {'i386', 'arm64'}:
                 files = ['MANIFEST', 'base.txz', 'src.txz']
             else:
                 files = ['MANIFEST', 'base.txz', 'lib32.txz', 'src.txz']
@@ -779,7 +798,8 @@ class IOCage:
 
     def exec_all(
         self, command, host_user='root', jail_user=None, console=False,
-        start_jail=False, interactive=False, unjailed=False, msg_return=False
+        start_jail=False, interactive=False, unjailed=False, msg_return=False,
+        keep_proxy=False
     ):
         """Runs exec for all jails"""
         self._all = False
@@ -787,18 +807,19 @@ class IOCage:
             self.jail = jail
             self.exec(
                 command, host_user, jail_user, console, start_jail,
-                interactive, unjailed, msg_return
+                interactive, unjailed, msg_return, keep_proxy
             )
 
     def exec(
         self, command, host_user='root', jail_user=None, console=False,
-        start_jail=False, interactive=False, unjailed=False, msg_return=False
+        start_jail=False, interactive=False, unjailed=False, msg_return=False,
+        keep_proxy=False
     ):
         """Executes a command in the jail as the supplied users."""
         if self._all:
             self.exec_all(
                 command, host_user, jail_user, console, start_jail,
-                interactive, unjailed, msg_return
+                interactive, unjailed, msg_return, keep_proxy
             )
             return
 
@@ -898,13 +919,15 @@ class IOCage:
                 raise e
             return
 
-        if interactive:
+        if interactive or pkg:
             ioc_exec.InteractiveExec(
                 command,
                 path,
                 uuid=uuid,
                 host_user=host_user,
                 jail_user=jail_user,
+                unjailed=pkg,
+                keep_proxy=keep_proxy,
                 skip=True
             )
             return
@@ -916,7 +939,8 @@ class IOCage:
                 uuid=uuid,
                 host_user=host_user,
                 jail_user=jail_user,
-                unjailed=pkg,
+                unjailed=unjailed,
+                keep_proxy=keep_proxy,
                 su_env=su_env
             ) as _exec:
                 output = ioc_common.consume_and_log(
@@ -994,12 +1018,23 @@ class IOCage:
         keep_jail_on_failure = kwargs.pop("keep_jail_on_failure", False)
         thick_config = kwargs.pop("thickconfig", False)
 
+        # the internal development record: the FreeCORE plugin catalog rules of the 15.0
+        # plugin store (the internal development record), carried onto 1.13 from the fork.
+        if plugins or plugin_name:
+            kwargs['git_repository'] = ioc_json.normalize_plugin_repository(
+                kwargs.get('git_repository')
+            )
+            if not _list:
+                ioc_json.validate_plugin_repository_for_creation(
+                    kwargs['git_repository'], self.callback, self.silent
+                )
+
         freebsd_version = ioc_common.checkoutput(["freebsd-version"])
         arch = os.uname()[4]
 
         if not _list:
             if not kwargs.get('files', None):
-                if arch == 'arm64':
+                if arch in {'i386', 'arm64'}:
                     kwargs['files'] = ['MANIFEST', 'base.txz', 'src.txz']
                 else:
                     kwargs['files'] = ['MANIFEST', 'base.txz', 'lib32.txz',
@@ -1037,8 +1072,12 @@ class IOCage:
             if plugins:
                 ioc_plugin.IOCPlugin(
                     release=release,
+                    jail=name,
                     plugin=plugin_name,
                     branch=branch,
+                    silent=self.silent,
+                    keep_jail_on_failure=keep_jail_on_failure,
+                    callback=self.callback,
                     thickconfig=thick_config,
                     **kwargs).fetch_plugin_index(
                         props, accept_license=accept, official=official)
@@ -1555,7 +1594,7 @@ class IOCage:
             ioc_common.logit(
                 {
                     "level": "EXCEPTION",
-                    "message": f"{prop} is is missing a value!"
+                    "message": f"{prop} is missing a value!"
                 },
                 _callback=self.callback,
                 silent=self.silent)
@@ -1635,8 +1674,22 @@ class IOCage:
             rtsold_enable = "YES" if "accept_rtadv" in value else "NO"
             ioc_common.set_rcconf(path, "rtsold_enable", rtsold_enable)
 
+    def snap_list_all(self, long, _sort):
+        self._all = False
+        snap_list = []
+        for jail in self.jails:
+            self.jail = jail
+            snap_list.extend(
+                [[jail, *snap] for snap in self.snap_list(long, _sort)]
+            )
+        sort = ioc_common.ioc_sort("snaplist", _sort, data=snap_list)
+        snap_list.sort(key=sort)
+        return snap_list
+
     def snap_list(self, long=True, _sort="created"):
         """Gathers a list of snapshots and returns it"""
+        if self._all:
+            return self.snap_list_all(long=long, _sort=_sort)
         uuid, path = self.__check_jail_existence__()
         conf = ioc_json.IOCJson(path, silent=self.silent).json_get_value('all')
         snap_list = []
@@ -1696,8 +1749,20 @@ class IOCage:
 
         return snap_list
 
+    def snapshot_all(self, name):
+        # We want a consistent name across a snapshot batch.
+        if not name:
+            name = datetime.datetime.utcnow().strftime("%F_%T")
+        self._all = False
+        for jail in self.jails:
+            self.jail = jail
+            self.snapshot(name)
+
     def snapshot(self, name):
         """Will create a snapshot for the given jail"""
+        if self._all:
+            self.snapshot_all(name)
+            return
         date = datetime.datetime.utcnow().strftime("%F_%T")
         uuid, path = self.__check_jail_existence__()
 
@@ -1853,8 +1918,16 @@ class IOCage:
             self.update(pkgs)
 
     def update_plugin(self, update_jail=True):
+        """
+        the internal development record: update a plugin jail the way the 15.0 plugin store
+        does (middleware plugin.update_plugin): pull the plugin's repository,
+        upgrade the jail when the manifest names a newer major release, else
+        update it, with update_jail choosing whether the jail's own release
+        is patched too. Ported from the TrueNAS iocage fork 15.0 shipped.
+        """
         uuid, path = self.__check_jail_existence__()
-        conf = ioc_json.IOCJson(path, silent=self.silent, stop=True).json_get_value('all')
+        conf = ioc_json.IOCJson(
+            path, silent=self.silent, stop=True).json_get_value('all')
         if conf['type'] != 'pluginv2':
             ioc_common.logit(
                 {
@@ -1863,7 +1936,8 @@ class IOCage:
                 })
 
         plugin_obj = ioc_plugin.IOCPlugin(
-            jail=uuid, plugin=conf['plugin_name'], git_repository=conf['plugin_repository'], callback=self.callback,
+            jail=uuid, plugin=conf['plugin_name'],
+            git_repository=conf['plugin_repository'], callback=self.callback,
             silent=True,
         )
         plugin_obj.pull_clone_git_repo()
@@ -1873,10 +1947,16 @@ class IOCage:
         if jail_rel < manifest_rel:
             return self.upgrade(None)
         else:
-            return self.update(False, update_jail)
+            return self.update(False, update_jail=update_jail)
 
-    def update(self, pkgs=False, update_jail=True):
-        """Updates a jail to the latest patchset."""
+    def update(self, pkgs=False, server=None, verify=True, *, update_jail=True):
+        """
+        Updates a jail to the latest patchset.
+
+        the internal development record: update_jail=False leaves a plugin jail's own
+        release unpatched and updates only the plugin, as the 15.0 plugin
+        store's "Update jail as well" box expects. Other jails always patch.
+        """
         if self._all:
             self.update_all(pkgs)
             return
@@ -1940,7 +2020,7 @@ class IOCage:
                 self.stop()
                 self.silent = _silent
         else:
-            if pkgs and not plugin_jail:
+            if pkgs and not (jail_type in ('plugin', 'pluginv2')):
                 # Let's update pkg repos first
                 ioc_common.logit({
                     'level': 'INFO',
@@ -1971,7 +2051,7 @@ class IOCage:
                     'message': 'Upgraded pkgs successfully.'
                 })
 
-            if plugin_jail:
+            if jail_type == "pluginv2" or jail_type == "plugin":
                 # TODO: Warn about erasing all pkgs
                 ioc_common.logit({
                     'level': 'INFO',
@@ -1998,7 +2078,12 @@ class IOCage:
             params = [] if is_basejail else [True, uuid]
             try:
                 if not plugin_jail or update_jail:
-                    ioc_fetch.IOCFetch(release, callback=self.callback).fetch_update(*params)
+                    ioc_fetch.IOCFetch(
+                        release,
+                        server,
+                        verify=verify,
+                        callback=self.callback
+                    ).fetch_update(*params)
             finally:
                 if not started and jail_type == 'pluginv2':
                     silent = self.silent
@@ -2169,8 +2254,44 @@ Remove the snapshot: ioc_upgrade_{_date} if everything is OK
 
         ioc_debug.IOCDebug(directory).run_debug()
 
-    def snap_remove(self, snapshot):
+    def _get_cloned_datasets(self):
+        return {
+            d.properties.get('origin', "").replace('/root@', '@')
+            for d in Dataset(
+                os.path.join(self.pool, 'iocage')
+            ).get_dependents(depth=3)
+        }
+
+    def snap_remove_all(self, snapshot):
+        self._all = False
+        cloned_datasets = self._get_cloned_datasets()
+
+        for jail in self.jails:
+            self.jail = jail
+            self.snap_remove(snapshot, cloned_datasets=cloned_datasets)
+
+    def snap_remove(self, snapshot, cloned_datasets=None):
         """Removes user supplied snapshot from jail"""
+        if self._all:
+            self.snap_remove_all(snapshot)
+            return
+        if snapshot == 'ALL':
+            if cloned_datasets is None:
+                cloned_datasets = self._get_cloned_datasets()
+            for snapshot, *_ in reversed(self.snap_list()):
+                if snapshot in cloned_datasets:
+                    ioc_common.logit({
+                        'level': 'WARNING',
+                        'message': f"Skipped snapshot {snapshot}: used by clones."
+                    })
+                elif snapshot.rsplit('@', 1)[0].endswith('/root'):
+                    # Deleting here would result in trying to delete
+                    # the jail dataset-level snapshot twice since we construct
+                    # the target based on the uuid, not path, below.
+                    continue
+                else:
+                    self.snap_remove(snapshot.rsplit('@', 1)[-1])
+            return
         uuid, path = self.__check_jail_existence__()
         conf = ioc_json.IOCJson(path, silent=self.silent).json_get_value('all')
 

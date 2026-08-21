@@ -22,18 +22,211 @@
 # IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 """iocage exec module."""
+import collections
+import errno
+import fcntl
+import os
+import pty
+import re
+import resource
+import select
+import signal
+import struct
 import subprocess as su
+import termios
+import tty
 
 import iocage_lib.ioc_common
 import iocage_lib.ioc_json
 import iocage_lib.ioc_list
 import iocage_lib.ioc_start
 import iocage_lib.ioc_exceptions
-import select
-import fcntl
-import os
-import re
-import collections
+
+
+_WINSIZE = struct.Struct('HHHH')
+
+
+def _copy_terminal_size(source_fd, target_fd):
+    """Copy a terminal size without exposing the source terminal."""
+    try:
+        size = fcntl.ioctl(
+            source_fd, termios.TIOCGWINSZ, _WINSIZE.pack(0, 0, 0, 0)
+        )
+        fcntl.ioctl(target_fd, termios.TIOCSWINSZ, size)
+    except (OSError, termios.error):
+        return False
+
+    return True
+
+
+def _close_inherited_fds():
+    """Leave the isolated child only its pseudo-terminal descriptors."""
+    maximum = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if maximum == resource.RLIM_INFINITY:
+        try:
+            maximum = os.sysconf('SC_OPEN_MAX')
+        except (OSError, ValueError):
+            maximum = 65536
+    os.closerange(3, int(maximum))
+
+
+def _restore_exec_signals():
+    """Match subprocess' default signal restoration before exec."""
+    for name in ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ'):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            signal.signal(signum, signal.SIG_DFL)
+
+
+def _write_all(fd, data):
+    while data:
+        try:
+            written = os.write(fd, data)
+        except InterruptedError:
+            continue
+        data = data[written:]
+
+
+def _wait_for_child(pid):
+    while True:
+        try:
+            _, status = os.waitpid(pid, 0)
+        except InterruptedError:
+            continue
+        return os.waitstatus_to_exitcode(status)
+
+
+def _signal_child(pid, signum):
+    try:
+        os.killpg(pid, signum)
+    except ProcessLookupError:
+        try:
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            pass
+
+
+def _run_isolated_pty(command, env, stdin_fd=0, stdout_fd=1):
+    """
+    Run an interactive argv in a new session and controlling pseudo-terminal.
+
+    Only bytes, terminal size, and approved environment values cross the
+    boundary. The child never receives the host terminal descriptor, so a
+    jail process cannot use terminal ioctls against the host root shell.
+    """
+    if isinstance(command, (str, bytes)) or not command:
+        raise ValueError('Interactive command must be a non-empty argv')
+
+    command = list(command)
+    child_env = dict(env)
+    master_fd, slave_fd = pty.openpty()
+    _copy_terminal_size(stdin_fd, slave_fd)
+    pid = os.fork()
+
+    if pid == 0:
+        try:
+            os.close(master_fd)
+            if hasattr(os, 'login_tty'):
+                os.login_tty(slave_fd)
+            else:
+                os.setsid()
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+                for fd in (0, 1, 2):
+                    os.dup2(slave_fd, fd)
+                if slave_fd > 2:
+                    os.close(slave_fd)
+            _close_inherited_fds()
+            _restore_exec_signals()
+            os.execvpe(command[0], command, child_env)
+        except BaseException as e:
+            message = f'iocage: failed to execute {command[0]}: {e}\r\n'
+            with iocage_lib.ioc_exceptions.ignore_exceptions(OSError):
+                os.write(2, message.encode(errors='replace'))
+            os._exit(127)
+
+    os.close(slave_fd)
+    original_mode = None
+    relay_error = None
+    signal_handlers = {}
+
+    try:
+        try:
+            original_mode = termios.tcgetattr(stdin_fd)
+            tty.setraw(stdin_fd)
+        except (OSError, termios.error):
+            pass
+
+        def resize_terminal(_signum=None, _frame=None):
+            _copy_terminal_size(stdin_fd, master_fd)
+
+        def forward_signal(signum, _frame):
+            _signal_child(pid, signum)
+
+        for signum, handler in (
+            (getattr(signal, 'SIGWINCH', None), resize_terminal),
+            (signal.SIGINT, forward_signal),
+        ):
+            if signum is None:
+                continue
+            try:
+                signal_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, handler)
+            except ValueError:
+                # Signal handlers are main-thread only. This keeps the relay
+                # usable by embedded library callers while the CLI gets full
+                # resize and interrupt handling.
+                signal_handlers.pop(signum, None)
+
+        input_open = True
+        while True:
+            readers = [master_fd]
+            if input_open:
+                readers.append(stdin_fd)
+
+            try:
+                ready, _, _ = select.select(readers, [], [])
+            except InterruptedError:
+                continue
+
+            if master_fd in ready:
+                try:
+                    output = os.read(master_fd, 65536)
+                except OSError as e:
+                    if e.errno == errno.EIO:
+                        break
+                    raise
+                if not output:
+                    break
+                _write_all(stdout_fd, output)
+
+            if input_open and stdin_fd in ready:
+                data = os.read(stdin_fd, 65536)
+                if data:
+                    _write_all(master_fd, data)
+                else:
+                    # A pipe closing must become terminal EOF for the child.
+                    _write_all(master_fd, b'\x04')
+                    input_open = False
+    except BaseException as e:
+        relay_error = e
+        _signal_child(pid, signal.SIGHUP)
+    finally:
+        for signum, handler in signal_handlers.items():
+            signal.signal(signum, handler)
+        if original_mode is not None:
+            with iocage_lib.ioc_exceptions.ignore_exceptions(
+                OSError, termios.error
+            ):
+                termios.tcsetattr(
+                    stdin_fd, termios.TCSAFLUSH, original_mode
+                )
+        with iocage_lib.ioc_exceptions.ignore_exceptions(OSError):
+            os.close(master_fd)
+
+    returncode = _wait_for_child(pid)
+    if relay_error is not None:
+        raise relay_error
+    return returncode
 
 
 class IOCExec(object):
@@ -52,6 +245,7 @@ class IOCExec(object):
         skip=False,
         stdin_bytestring=None,
         su_env=None,
+        keep_proxy=False,
         decode=False,
         callback=None
     ):
@@ -77,6 +271,17 @@ class IOCExec(object):
         su_env.setdefault('TERM', 'xterm-256color')
         su_env.setdefault('LANG', env_lang)
         su_env.setdefault('LC_ALL', env_lang)
+        if unjailed or keep_proxy:
+            if os.environ.get('http_proxy', '') != '':
+                su_env.setdefault('http_proxy', os.environ.get('http_proxy', ''))
+            elif os.environ.get('HTTP_PROXY', '') != '':
+                su_env.setdefault('HTTP_PROXY', os.environ.get('HTTP_PROXY', ''))
+            if os.environ.get('HTTPS_PROXY', '') != '':
+                su_env.setdefault('HTTPS_PROXY', os.environ.get('HTTPS_PROXY', ''))
+            if os.environ.get('HTTP_PROXY_AUTH', '') != '':
+                su_env.setdefault('HTTP_PROXY_AUTH', os.environ.get('HTTP_PROXY_AUTH', ''))
+            if os.environ.get('NO_PROXY', '') != '':
+                su_env.setdefault('NO_PROXY', os.environ.get('NO_PROXY', ''))
 
         self.su_env = su_env
         self.callback = callback
@@ -303,11 +508,8 @@ class InteractiveExec(IOCExec):
                     'jid', uuid=self.uuid
                 )
 
-        try:
-            su.run(
-                self.cmd, check=True, env=self.su_env
-            )
-        except su.CalledProcessError:
+        returncode = _run_isolated_pty(self.cmd, self.su_env)
+        if returncode:
             iocage_lib.ioc_common.logit(
                 {
                     'level': 'EXCEPTION',
@@ -315,5 +517,3 @@ class InteractiveExec(IOCExec):
                 },
                 exception=iocage_lib.ioc_exceptions.CommandFailed,
                 _callback=self.callback)
-        except Exception:
-            raise

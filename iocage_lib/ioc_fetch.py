@@ -25,6 +25,8 @@
 import hashlib
 import logging
 import os
+import posixpath
+import re
 import shutil
 import subprocess as su
 import tarfile
@@ -47,8 +49,139 @@ import iocage_lib.ioc_start
 from iocage_lib.pools import Pool
 from iocage_lib.dataset import Dataset
 
-# deliberately crash if tarfile doesn't have required filter
-tarfile.tar_filter
+
+def _release_archive_filter(member, dest_path):
+    """Apply path/link checks without stripping trusted release modes."""
+    original_mode = member.mode
+    filtered_member = tarfile.tar_filter(member, dest_path)
+
+    if filtered_member is None:
+        return None
+
+    if filtered_member.issym() and posixpath.isabs(
+        filtered_member.linkname
+    ):
+        # FreeBSD release archives use absolute symbolic links as paths
+        # rooted inside the future jail (for example, etc/termcap points at
+        # /usr/share/misc/termcap). Validate a relative surrogate against
+        # the extraction root, but retain the jail-root link spelling.
+        normalized_link = posixpath.normpath(filtered_member.linkname)
+        jail_link = normalized_link.lstrip('/')
+        if (
+            not jail_link or
+            filtered_member.linkname != f'/{jail_link}'
+        ):
+            raise tarfile.AbsoluteLinkError(filtered_member)
+
+        link_dir = posixpath.dirname(
+            filtered_member.name.rstrip('/')
+        ) or '.'
+        checked_link = tarfile.data_filter(
+            filtered_member.replace(
+                linkname=posixpath.relpath(jail_link, link_dir),
+                deep=False,
+            ),
+            dest_path,
+        )
+        if checked_link is None:
+            return None
+    elif filtered_member.islnk() or filtered_member.issym():
+        # tar_filter validates member paths, but data_filter also validates
+        # relative symbolic-link and hard-link targets. Retain only its
+        # normalized link name so release ownership metadata is not stripped.
+        checked_link = tarfile.data_filter(filtered_member, dest_path)
+        if checked_link is None:
+            return None
+        if checked_link.linkname != filtered_member.linkname:
+            filtered_member = filtered_member.replace(
+                linkname=checked_link.linkname, deep=False
+            )
+
+    if filtered_member.mode != original_mode:
+        filtered_member = filtered_member.replace(
+            mode=original_mode, deep=False
+        )
+
+    return filtered_member
+
+
+# the internal development record: FreeBSD withdraws EOL releases from download.freebsd.org
+# and keeps them on archive.freebsd.org under an identical per-release layout;
+# only the host and the root directory differ.
+FREEBSD_PRIMARY_SERVER = 'download.freebsd.org'
+FREEBSD_ARCHIVE_SERVER = 'archive.freebsd.org'
+FREEBSD_ARCHIVE_ROOT = 'old-releases'
+# How far back an archived release may be offered: two major versions below
+# the host (a 15.x host offers 13.x), which is the range a jail userland can
+# realistically run on the host kernel and the range the mirror change hit.
+ARCHIVE_MAJOR_SPAN = 2
+
+
+def server_host(server):
+    """The bare host of a server value, without scheme, path or case."""
+    server = str(server).strip().lower()
+    return re.sub(r'^[a-z]+://', '', server).split('/')[0]
+
+
+def is_freebsd_mirror(server):
+    return server_host(server) in (
+        FREEBSD_PRIMARY_SERVER, FREEBSD_ARCHIVE_SERVER
+    )
+
+
+def release_major(release):
+    """The major version of an ``XX.Y-RELEASE`` name, or None."""
+    match = re.match(r'^(\d+)\.', str(release))
+    return int(match.group(1)) if match else None
+
+
+def archived_release_candidates(primary, archived, host_major):
+    """Archived releases worth offering beside the primary mirror's list.
+
+    Only releases the primary no longer lists are added (the archive must
+    never shadow a live release), and only within ARCHIVE_MAJOR_SPAN majors
+    of the host, so a 15.x host sees 13.x and 14.x but not 5.1-RELEASE.
+    """
+    floor = host_major - ARCHIVE_MAJOR_SPAN
+    return [
+        r for r in archived
+        if r not in primary
+        and release_major(r) is not None
+        and floor <= release_major(r) <= host_major
+    ]
+
+
+def archive_fallback(server, root_dir, release, arch, verify=True,
+                     get=None):
+    """Where to fetch ``release`` from when the primary mirror no longer has it.
+
+    Returns ``(server, root_dir, archived)``. The archive is only consulted
+    when the caller is on the default primary mirror and default root
+    directory, and only after the primary answered 404 for the release; a
+    live release is never shadowed, and a user-supplied server or root
+    directory is never second-guessed.
+    """
+    get = get or requests.get
+    if not release or root_dir != f'ftp/releases/{arch}' \
+            or server_host(server) != FREEBSD_PRIMARY_SERVER:
+        return server, root_dir, False
+    try:
+        primary = get(f'{server}/{root_dir}/{release}/', verify=verify,
+                      timeout=30)
+    except requests.RequestException:
+        return server, root_dir, False
+    if primary.status_code != 404:
+        return server, root_dir, False
+    archive_server = f'https://{FREEBSD_ARCHIVE_SERVER}'
+    archive_root = f'{FREEBSD_ARCHIVE_ROOT}/{arch}'
+    try:
+        archived = get(f'{archive_server}/{archive_root}/{release}/',
+                       verify=verify, timeout=30)
+    except requests.RequestException:
+        return server, root_dir, False
+    if archived.status_code != requests.codes.ok:
+        return server, root_dir, False
+    return archive_server, archive_root, True
 
 
 class IOCFetch:
@@ -86,6 +219,7 @@ class IOCFetch:
 
         self.root_dir = root_dir
         self.arch = os.uname()[4]
+        self.archived = False
         self.http = http
         self._file = _file
         self.verify = verify
@@ -126,7 +260,7 @@ class IOCFetch:
             # We want a dynamic EOL
             try:
                 if "-RELEASE" in eol[1]:
-                    eol = eol[1].strip('</td')
+                    eol = eol[1].strip('</td').strip('</p')
 
                     if eol not in eol_releases:
                         eol_releases.append(eol)
@@ -134,6 +268,41 @@ class IOCFetch:
                 pass
 
         return eol_releases
+
+    def __fetch_archived_releases__(self, releases):
+        """
+        Releases the primary mirror no longer lists but the archive still
+        carries, when we are on the default mirror. A failure to read the
+        archive index is not an error: the primary list stands on its own.
+        """
+        if self.hardened or self.auth or \
+                server_host(self.server) != FREEBSD_PRIMARY_SERVER or \
+                self.root_dir != f"ftp/releases/{self.arch}":
+            return []
+        try:
+            req = requests.get(
+                f"https://{FREEBSD_ARCHIVE_SERVER}/{FREEBSD_ARCHIVE_ROOT}/"
+                f"{self.arch}/", verify=self.verify, timeout=30
+            )
+        except requests.RequestException:
+            return []
+        if req.status_code != requests.codes.ok:
+            return []
+        archived = []
+        for rel in req.content.split():
+            rel = rel.decode()
+            rel = rel.strip("href=").strip("/").split(">")
+            if "-RELEASE" in rel[0]:
+                rel = rel[0].strip('"').strip("/").strip("/</a").strip(
+                    'title="')
+                if rel not in archived:
+                    archived.append(rel)
+        host_major = release_major(
+            iocage_lib.ioc_common.get_host_release()
+        )
+        if host_major is None:
+            return []
+        return archived_release_candidates(releases, archived, host_major)
 
     def __fetch_validate_release__(self, releases, eol=None):
         """
@@ -247,7 +416,8 @@ class IOCFetch:
                 pass
             else:
                 self.zpool.create_dataset({
-                    'name': pool_dataset, 'properties': {'compression': 'lz4'}
+                    'name': pool_dataset,
+                    'properties': {'compression': 'lz4'},
                 })
 
             for f in self.files:
@@ -425,6 +595,7 @@ class IOCFetch:
                         _callback=self.callback,
                         silent=self.silent)
 
+                releases += self.__fetch_archived_releases__(releases)
                 releases = iocage_lib.ioc_common.sort_release(
                     releases, fetch_releases=True)
 
@@ -436,6 +607,24 @@ class IOCFetch:
         if self.hardened:
             self.root_dir = f"{rdir}/HardenedBSD-{self.release.upper()}-" \
                 f"{self.arch}-LATEST"
+
+        if not self.hardened and not self.auth:
+            self.server, self.root_dir, self.archived = archive_fallback(
+                self.server, self.root_dir, self.release, self.arch,
+                verify=self.verify
+            )
+            if self.archived:
+                iocage_lib.ioc_common.logit(
+                    {
+                        "level": "INFO",
+                        "message":
+                        f"{self.release} is no longer on "
+                        f"{FREEBSD_PRIMARY_SERVER} (EOL); fetching it from "
+                        f"{FREEBSD_ARCHIVE_SERVER}/{FREEBSD_ARCHIVE_ROOT} "
+                        "instead\n"
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
 
         self.__fetch_exists__()
         iocage_lib.ioc_common.logit(
@@ -500,10 +689,16 @@ class IOCFetch:
                 release, verify=self.verify)
 
         if r.status_code == 404:
+            where = f"{self.server}/{self.root_dir}"
+            if not self.hardened and not self.auth and \
+                    server_host(self.server) == FREEBSD_PRIMARY_SERVER and \
+                    self.root_dir == f"ftp/releases/{self.arch}":
+                where += f" or {FREEBSD_ARCHIVE_SERVER}/" \
+                    f"{FREEBSD_ARCHIVE_ROOT}/{self.arch}"
             iocage_lib.ioc_common.logit(
                 {
                     "level": "EXCEPTION",
-                    "message": f"{self.release} was not found!"
+                    "message": f"{self.release} was not found at {where}!"
                 },
                 _callback=self.callback,
                 silent=self.silent)
@@ -523,7 +718,7 @@ class IOCFetch:
             )
 
             if 'MANIFEST' not in os.listdir(release_download_path) and \
-                    self.server == 'https://download.freebsd.org':
+                    is_freebsd_mirror(self.server):
                 iocage_lib.ioc_common.logit(
                     {
                         'level': 'INFO',
@@ -821,7 +1016,9 @@ class IOCFetch:
             # removing them first.
             member = self.__fetch_extract_remove__(f)
             member = self.__fetch_check_members__(member)
-            f.extractall(dest, members=member, filter='tar')
+            f.extractall(
+                dest, members=member, filter=_release_archive_filter
+            )
 
     def fetch_update(self, cli=False, uuid=None):
         """This calls 'freebsd-update' to update the fetched RELEASE."""
@@ -864,8 +1061,6 @@ class IOCFetch:
                 _callback=self.callback,
                 silent=self.silent)
 
-        shutil.copy("/etc/resolv.conf", f"{mount_root}/etc/resolv.conf")
-
         path = '/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:'\
                '/usr/local/bin:/root/bin'
         fetch_env = {
@@ -894,8 +1089,8 @@ class IOCFetch:
 
         su.Popen(cmd).communicate()
         if self.verify:
-            f = "https://raw.githubusercontent.com/freebsd/freebsd" \
-                "/master/usr.sbin/freebsd-update/freebsd-update.sh"
+            f = "https://cgit.FreeBSD.org/src/plain" \
+                "/usr.sbin/freebsd-update/freebsd-update.sh"
 
             tmp = tempfile.NamedTemporaryFile(delete=False)
             with urllib.request.urlopen(f) as fbsd_update:

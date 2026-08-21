@@ -38,12 +38,9 @@ import iocage_lib.ioc_list
 import iocage_lib.ioc_start
 import iocage_lib.ioc_stop
 import iocage_lib.ioc_exceptions
-import dns.resolver
-import dns.exception
 import shutil
 
 from iocage_lib.cache import cache
-from iocage_lib.create_utils import strip_jail_for_base_jail
 from iocage_lib.dataset import Dataset
 
 
@@ -623,7 +620,36 @@ class IOCCreate(object):
                     location, "rtsold_enable", rtsold_enable)
 
         if self.basejail or self.plugin:
-            iocjson.json_write(strip_jail_for_base_jail(config, self.release, self.iocroot, jail_uuid))
+            basedirs = ["bin", "boot", "lib", "libexec", "rescue", "sbin",
+                        "usr/bin", "usr/include", "usr/lib",
+                        "usr/libexec", "usr/sbin", "usr/share",
+                        "usr/libdata", "usr/lib32"]
+
+            if "-STABLE" in self.release:
+                # HardenedBSD does not have this.
+                basedirs.remove("usr/lib32")
+
+            for bdir in basedirs:
+                if "-RELEASE" not in self.release and "-STABLE" not in \
+                        self.release:
+                    _type = "templates"
+                else:
+                    _type = "releases"
+
+                source = f"{self.iocroot}/{_type}/{self.release}/root/{bdir}"
+                destination = f"{self.iocroot}/jails/{jail_uuid}/root/{bdir}"
+
+                # This reduces the REFER of the basejail.
+                # Just much faster by almost a factor of 2 than the builtins.
+                su.Popen(["rm", "-r", "-f", destination]).communicate()
+                os.mkdir(destination)
+
+                iocage_lib.ioc_fstab.IOCFstab(jail_uuid, "add", source,
+                                              destination, "nullfs", "ro", "0",
+                                              "0", silent=True)
+                config["basejail"] = 1
+
+            iocjson.json_write(config)
 
         if not self.plugin:
             if self.clone:
@@ -735,6 +761,8 @@ class IOCCreate(object):
                 _callback=self.callback,
                 silent=False)
 
+            import dns.resolver
+            import dns.exception
             try:
                 dns.resolver.query(repo)
             except dns.resolver.NoNameservers:
@@ -930,10 +958,13 @@ class IOCCreate(object):
                         iocage_lib.ioc_common.consume_and_log(
                             _exec,
                             callback=self.callback,
-                            log=not(self.silent)
+                            log=not (self.silent)
                         )
                 except iocage_lib.ioc_exceptions.CommandFailed as e:
-                    pkg_stderr = e.message[-1].decode().rstrip()
+                    nonempty_lines = [line.rstrip() for line in e.message if line.rstrip()]
+                    pkg_stderr = ''
+                    if len(nonempty_lines) > 0:
+                        pkg_stderr = nonempty_lines[-1].decode()
                     pkg_err = True
 
                 if not pkg_err:

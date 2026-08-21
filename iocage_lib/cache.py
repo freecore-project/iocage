@@ -1,9 +1,11 @@
+import json
 import os
 import subprocess as su
 import threading
 
 from iocage_lib.zfs import (
-    all_properties, dataset_exists, get_all_dependents, get_dependents_with_depth,
+    all_properties, dataset_exists, get_dependents,
+    get_dependents_with_depth,
 )
 
 
@@ -14,7 +16,7 @@ class Cache:
     def __init__(self):
         self.fields = [
             'dataset_data', 'pool_data', 'dataset_dep_data', 'ioc_pool', 'ioc_dataset',
-            '_freebsd_version',
+            '_freebsd_version', '_plugin_manifest_schema'
         ]
         self.reset()
 
@@ -41,15 +43,19 @@ class Cache:
                     self.dataset_data.update(
                         all_properties([p for p in pools], types=['filesystem'])
                     )
-                for p in filter(
-                    lambda p: (
-                        p.get('org.freebsd.ioc:active') == 'yes' and p.get('mounted') == 'yes' and not(
-                            p.get('encryption', 'off') != 'off' and p.get('keystatus', 'available') != 'available'
-                        )
-                    ),
-                    map(lambda p: {**self.dataset_data.get(p, {}), 'name': p}, pools)
-                ):
-                    self.ioc_pool = p['name']
+                for pool in pools:
+                    properties = self.dataset_data.get(pool, {})
+                    encrypted_unavailable = (
+                        properties.get('encryption', 'off') != 'off' and
+                        properties.get('keystatus', 'available') !=
+                        'available'
+                    )
+                    if (
+                        properties.get('org.freebsd.ioc:active') == 'yes' and
+                        properties.get('mounted') == 'yes' and
+                        not encrypted_unavailable
+                    ):
+                        self.ioc_pool = pool
             return self.ioc_pool
         finally:
             if lock:
@@ -86,13 +92,12 @@ class Cache:
         if lock:
             self.cache_lock.acquire()
         try:
-            if not self.dataset_dep_data:
+            if self.dataset_dep_data is None:
                 self.dataset_dep_data = {}
-                for ds in get_all_dependents():
-                    self.dataset_dep_data[ds] = []
-                    for k in self.dataset_dep_data:
-                        if ds == k or ds.startswith(f'{k}/'):
-                            self.dataset_dep_data[k].append(ds)
+
+            if dataset not in self.dataset_dep_data:
+                # Keep cache population bounded to the requested subtree.
+                self.dataset_dep_data[dataset] = get_dependents(dataset)
 
             return get_dependents_with_depth(
                 dataset, self.dataset_dep_data.get(dataset, []), depth
@@ -120,6 +125,16 @@ class Cache:
         finally:
             if lock:
                 self.cache_lock.release()
+
+    @property
+    def plugin_manifest_schema(self):
+        if not self._plugin_manifest_schema:
+            current_dir = os.path.dirname(os.path.realpath(__file__))
+            schema_path = os.path.join(current_dir, "plugin_manifest.json")
+
+            with open(schema_path, "r") as f:
+                self._plugin_manifest_schema = json.load(f)
+        return self._plugin_manifest_schema
 
     def reset(self):
         with self.cache_lock:

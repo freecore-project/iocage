@@ -74,7 +74,10 @@ class IOCImage(object):
                 silent=self.silent)
 
         datasets = su.Popen(
-            ["zfs", "list", "-H", "-r", "-t", "filesystem", "-o", "name", image_path],
+            [
+                "zfs", "list", "-H", "-r", "-t", "filesystem",
+                "-o", "name", image_path,
+            ],
             stdout=su.PIPE,
             stderr=su.PIPE).communicate()[0].decode("utf-8").split()
 
@@ -286,12 +289,12 @@ class IOCImage(object):
                 )
 
                 chunk_size = 10 * 1024 * 1024
+
                 with (f.open(name) if compression_algo == 'zip' else f.extractfile(member)) as file:
-                    while True:
-                        data = file.read(chunk_size)
-                        if not data:
-                            break
+                    data = file.read(chunk_size)
+                    while data is not None and len(data) > 0:
                         recv.stdin.write(data)
+                        data = file.read(chunk_size)
 
                 recv.communicate()
 
