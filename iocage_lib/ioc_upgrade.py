@@ -235,24 +235,44 @@ class IOCUpgrade:
         if snapshot:
             self.__snapshot_jail__()
 
-        p = pathlib.Path(
-            f"{self.iocroot}/releases/{self.new_release}/root/usr/src")
-        p_files = []
+        # Prefer the etc reference tree that base.txz already ships at
+        # releases/<rel>/root/var/db/etcupdate/current, applied with
+        # "etcupdate -t". Running the jail's own (older) etcupdate against a
+        # newer /usr/src breaks on a 13.x -> 15.x jump: FreeBSD 15 stages
+        # lib/libc's nsswitch.conf through ${.OBJDIR}, while a 13.x etcupdate
+        # only pre-creates obj dirs for etc/, so bmake writes into the
+        # read-only src nullfs mount and the whole upgrade aborts. The
+        # reference tree needs no compiler, no obj dirs and no src.txz.
+        reference_tree = pathlib.Path(
+            f"{self.iocroot}/releases/{self.new_release}"
+            "/root/var/db/etcupdate/current"
+        )
+        use_reference_tree = (
+            reference_tree.is_dir() and any(reference_tree.iterdir())
+        )
 
-        if p.exists():
-            for f in p.iterdir():
-                # We want to make sure files actually exist as well
-                p_files.append(f)
+        if not use_reference_tree:
+            # Older releases predate the shipped reference tree; fall back to
+            # building it from source, which is what requires src.txz.
+            p = pathlib.Path(
+                f"{self.iocroot}/releases/{self.new_release}/root/usr/src")
+            p_files = []
 
-        if not p_files:
-            msg = f"{self.new_release} is missing 'src.txz', please refetch!"
-            iocage_lib.ioc_common.logit(
-                {
-                    "level": "EXCEPTION",
-                    "message": msg
-                },
-                _callback=self.callback,
-                silent=self.silent)
+            if p.exists():
+                for f in p.iterdir():
+                    # We want to make sure files actually exist as well
+                    p_files.append(f)
+
+            if not p_files:
+                msg = f"{self.new_release} is missing 'src.txz', please" \
+                    " refetch!"
+                iocage_lib.ioc_common.logit(
+                    {
+                        "level": "EXCEPTION",
+                        "message": msg
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
 
         self.__upgrade_replace_basejail_paths__()
         ioc_up_dir = pathlib.Path(f"{self.path}/iocage_upgrade")
@@ -260,34 +280,68 @@ class IOCUpgrade:
         if not ioc_up_dir.exists():
             ioc_up_dir.mkdir(exist_ok=True, parents=True)
 
-        mount_cmd = [
-            "mount_nullfs", "-o", "ro",
-            f"{self.iocroot}/releases/{self.new_release}/root/usr/src",
-            f"{self.path}/iocage_upgrade"
-        ]
-        try:
-            iocage_lib.ioc_exec.SilentExec(
-                mount_cmd,
-                self.path.replace('/root', ''),
-                uuid=self.uuid,
-                unjailed=True
-            )
-        except iocage_lib.ioc_exceptions.CommandFailed:
-            msg = "Mounting src into jail failed! Rolling back snapshot."
-            self.__rollback_jail__(name=snap_name)
+        if use_reference_tree:
+            # Stage the tarball inside the jail so jexec'd etcupdate can read
+            # it; -C keeps ownership/modes exactly as the release ships them.
+            tarball = f"{self.path}/iocage_upgrade/etcupdate-reference.tar"
+            tar_cmd = [
+                "tar", "-cf", tarball, "-C", str(reference_tree), "."
+            ]
+            try:
+                iocage_lib.ioc_exec.SilentExec(
+                    tar_cmd,
+                    self.path.replace('/root', ''),
+                    uuid=self.uuid,
+                    unjailed=True
+                )
+            except iocage_lib.ioc_exceptions.CommandFailed:
+                msg = "Preparing the etcupdate reference tree failed!" \
+                    " Rolling back snapshot."
+                self.__rollback_jail__(name=snap_name)
 
-            iocage_lib.ioc_common.logit(
-                {
-                    "level": "EXCEPTION",
-                    "message": msg
-                },
-                _callback=self.callback,
-                silent=self.silent)
+                iocage_lib.ioc_common.logit(
+                    {
+                        "level": "EXCEPTION",
+                        "message": msg
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
 
-        etcupdate_cmd = [
-            "/usr/sbin/jexec", f"ioc-{self.uuid.replace('.', '_')}",
-            "/usr/sbin/etcupdate", "-F", "-s", "/iocage_upgrade"
-        ]
+            etcupdate_cmd = [
+                "/usr/sbin/jexec", f"ioc-{self.uuid.replace('.', '_')}",
+                "/usr/sbin/etcupdate", "-F", "-t",
+                "/iocage_upgrade/etcupdate-reference.tar"
+            ]
+        else:
+            mount_cmd = [
+                "mount_nullfs", "-o", "ro",
+                f"{self.iocroot}/releases/{self.new_release}/root/usr/src",
+                f"{self.path}/iocage_upgrade"
+            ]
+            try:
+                iocage_lib.ioc_exec.SilentExec(
+                    mount_cmd,
+                    self.path.replace('/root', ''),
+                    uuid=self.uuid,
+                    unjailed=True
+                )
+            except iocage_lib.ioc_exceptions.CommandFailed:
+                msg = "Mounting src into jail failed! Rolling back snapshot."
+                self.__rollback_jail__(name=snap_name)
+
+                iocage_lib.ioc_common.logit(
+                    {
+                        "level": "EXCEPTION",
+                        "message": msg
+                    },
+                    _callback=self.callback,
+                    silent=self.silent)
+
+            etcupdate_cmd = [
+                "/usr/sbin/jexec", f"ioc-{self.uuid.replace('.', '_')}",
+                "/usr/sbin/etcupdate", "-F", "-s", "/iocage_upgrade"
+            ]
+
         try:
             iocage_lib.ioc_exec.SilentExec(
                 etcupdate_cmd,
@@ -299,11 +353,28 @@ class IOCUpgrade:
             # These are now the result of a failed merge, nuking and putting
             # the backup back
             msg = "etcupdate failed! Rolling back snapshot."
+
+            # etcupdate's own reason only reaches its logfile, so surface the
+            # tail of it instead of leaving the user with a bare failure.
+            etcupdate_log = pathlib.Path(f"{self.path}/var/db/etcupdate/log")
+            if etcupdate_log.is_file():
+                try:
+                    tail = etcupdate_log.read_text(
+                        errors="replace"
+                    ).splitlines()[-10:]
+                except OSError:
+                    tail = []
+                if tail:
+                    msg += "\netcupdate log:\n" + "\n".join(tail)
+
             self.__rollback_jail__(name=snap_name)
 
-            su.Popen([
-                "umount", "-f", f"{self.path}/iocage_upgrade"
-            ]).communicate()
+            if use_reference_tree:
+                su.Popen(["rm", "-f", tarball]).communicate()
+            else:
+                su.Popen([
+                    "umount", "-f", f"{self.path}/iocage_upgrade"
+                ]).communicate()
 
             iocage_lib.ioc_common.logit(
                 {
@@ -333,11 +404,14 @@ class IOCUpgrade:
             uuid=self.uuid
         )
 
-        umount_command = [
-            "umount", "-f", f"{self.path}/iocage_upgrade"
-        ]
+        if use_reference_tree:
+            cleanup_command = ["rm", "-f", tarball]
+        else:
+            cleanup_command = [
+                "umount", "-f", f"{self.path}/iocage_upgrade"
+            ]
         iocage_lib.ioc_exec.SilentExec(
-            umount_command,
+            cleanup_command,
             self.path.replace('/root', ''),
             uuid=self.uuid,
             unjailed=True
