@@ -24,6 +24,7 @@
 """Common methods we reuse."""
 import collections
 import contextlib
+import errno
 import ipaddress
 import logging
 import os
@@ -31,12 +32,13 @@ import shutil
 import stat
 import subprocess as su
 import tempfile as tmp
+
+import jsonschema
 import requests
 import datetime as dt
 import re
 import shlex
 import glob
-import netif
 import netifaces
 import concurrent.futures
 import json
@@ -44,6 +46,7 @@ import urllib.parse
 
 import iocage_lib.ioc_exceptions
 import iocage_lib.ioc_exec
+from iocage_lib.cache import cache
 
 from iocage_lib.dataset import Dataset
 
@@ -81,7 +84,7 @@ def callback(_log, callback_exception):
         else:
             if not isinstance(message, str) and isinstance(
                 message,
-                collections.Iterable
+                collections.abc.Iterable
             ):
                 message = '\n'.join(message)
 
@@ -119,6 +122,33 @@ def try_convert(value, default, *types):
             continue
 
     return default
+
+
+def parse_dhcp_address(ifconfig_output):
+    """Return the IPv4 address and prefix length from ifconfig output."""
+    if isinstance(ifconfig_output, bytes):
+        ifconfig_output = ifconfig_output.decode('utf-8')
+
+    for line in ifconfig_output.splitlines():
+        fields = line.split()
+        if not fields or fields[0] != 'inet':
+            continue
+
+        try:
+            address = fields[1]
+            netmask = fields[fields.index('netmask') + 1]
+            ipaddress.IPv4Address(address)
+            if netmask.lower().startswith('0x'):
+                netmask = str(ipaddress.IPv4Address(int(netmask, 16)))
+            prefix_length = ipaddress.IPv4Network(
+                f'0.0.0.0/{netmask}'
+            ).prefixlen
+        except (IndexError, ValueError) as e:
+            raise ValueError('Malformed IPv4 inet address') from e
+
+        return address, prefix_length
+
+    raise ValueError('No IPv4 inet address found')
 
 
 def raise_sort_error(sort_list):
@@ -186,6 +216,8 @@ def ioc_sort(caller, s_type, data=None):
 def get_natural_sortkey(text):
     # attempt to convert str to int to facilitate simplified natural sorting
     # integers will be ranked before alphanumerical values
+    if text is None:
+        return 30, None
     try:
         return 10, int(text)
     except ValueError:
@@ -412,30 +444,7 @@ def sort_release(releases, split=False, fetch_releases=False):
     release_list = []
     list_sort = False
 
-    try:
-        # Length 9 (standard) or 10 (plugins) is list -l,
-        # Length 5 is list
-
-        length = len(releases)
-
-        if fetch_releases:
-            pass
-        elif length == 9 or length == 10:
-            # Attempt to split off the -p* stuff.
-            try:
-                _release, _patch = releases[5].rsplit("-p", 1)
-            except ValueError:
-                _release = releases[5]
-                _patch = 0
-            list_sort = True
-        elif length == 5:
-            _release = releases[3]
-            _patch = 0
-            list_sort = True
-    except TypeError:
-        # This is list -r
-        pass
-
+    # This is list -r
     if split:
         for i, rel in enumerate(releases):
             try:
@@ -457,6 +466,25 @@ def sort_release(releases, split=False, fetch_releases=False):
             # enumeration ensures 11.2-LOCAL does not take the place of 11.2-R
             r_dict[f'{rel}_{i}'] = r_type
     else:
+        # Length 9 (standard) or 10 (plugins) is list -l,
+        # Length 5 is list
+
+        length = len(releases)
+
+        if fetch_releases:
+            pass
+        elif length == 9 or length == 10:
+            # Attempt to split off the -p* stuff.
+            try:
+                _release, _patch = releases[5].rsplit("-p", 1)
+            except ValueError:
+                _release = releases[5]
+                _patch = 0
+            list_sort = True
+        elif length == 5:
+            _release = releases[3]
+            _patch = 0
+            list_sort = True
         if list_sort:
             _release = _release.split("-", 1)
             try:
@@ -483,19 +511,16 @@ def sort_release(releases, split=False, fetch_releases=False):
                     pass
 
     ordered_r_dict = collections.OrderedDict(sorted(r_dict.items()))
-    index = 0
 
     for r, t in ordered_r_dict.items():
         if split:
             r = r.rsplit('_')[0]  # Remove the enumeration
             if t:
-                release_list.insert(index, [f"{r}-{t}"])
+                release_list.append([f"{r}-{t}"])
             else:
-                release_list.insert(index, [r])
-            index += 1
+                release_list.append([r])
         else:
-            release_list.insert(index, f"{r}-{t}")
-            index += 1
+            release_list.append(f"{r}-{t}")
 
     return release_list
 
@@ -599,6 +624,260 @@ def open_atomic(filepath, *args, **kwargs):
         os.chmod(filepath, 0o644)
 
 
+def open_root_file(path, mode):
+    """
+    Open the fixed-name file `path` in a shared directory such as /tmp
+    read-write, creating it with `mode` (under the umask), and return the
+    descriptor, without following a link (the internal development record).
+
+    A symlink in its place is removed and the file created anew; so is
+    anything that is not a regular file owned by this user with a single
+    link (a FIFO, another user's file, a hard link to some other file). A
+    plain file of our own is opened as it is, not truncated, so callers that
+    read the previous contents keep working. A directory still fails, as a
+    plain open() did.
+    """
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | \
+        os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags, mode)
+    except OSError as e:
+        # FreeBSD answers EMLINK for O_NOFOLLOW on a symlink, Linux ELOOP.
+        if e.errno not in (errno.EMLINK, errno.ELOOP):
+            raise
+        os.unlink(path)
+        return os.open(path, flags | os.O_EXCL, mode)
+
+    st = os.fstat(fd)
+    if stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() and \
+            st.st_nlink == 1:
+        return fd
+
+    os.close(fd)
+    os.unlink(path)
+    return os.open(path, flags | os.O_EXCL, mode)
+
+
+def _jail_etc_fd(jail_root):
+    dflags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    root_fd = os.open(jail_root, dflags)
+    try:
+        return os.open('etc', dflags, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def read_jail_etc_file(jail_root, name, binary=False):
+    """
+    The text of `<jail_root>/etc/<name>` (its bytes with `binary`), or None
+    when it is absent or not a regular file. No link inside the jail is
+    followed (the internal development record): `etc` that is not a directory raises
+    OSError.
+    """
+    etc_fd = _jail_etc_fd(jail_root)
+    try:
+        try:
+            fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
+                os.O_CLOEXEC, dir_fd=etc_fd
+            )
+        except OSError as e:
+            if e.errno in (errno.EMLINK, errno.ELOOP, errno.ENOENT):
+                return None
+            raise
+        with os.fdopen(fd, 'rb' if binary else 'r') as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return None
+            return f.read()
+    finally:
+        os.close(etc_fd)
+
+
+def write_jail_etc_file(jail_root, name, data=None, link=None, mode=0o644):
+    """
+    Replace `<jail_root>/etc/<name>` with `data` (bytes, given `mode`) or
+    with a symlink to `link`, without ever writing through a link found in
+    the jail (the internal development record).
+
+    `etc` is opened with O_NOFOLLOW; the new file is created next to the old
+    one under a temporary name (O_EXCL | O_NOFOLLOW) and renamed over it, so
+    whatever was there -- a file, a link, a FIFO -- is replaced, never
+    written into. `etc` that is not a directory raises OSError.
+    """
+    etc_fd = _jail_etc_fd(jail_root)
+    tmp_name = f'.{name}.iocage-{os.getpid()}'
+    try:
+        try:
+            os.unlink(tmp_name, dir_fd=etc_fd)
+        except FileNotFoundError:
+            pass
+        try:
+            if link is not None:
+                os.symlink(link, tmp_name, dir_fd=etc_fd)
+            else:
+                fd = os.open(
+                    tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                    os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=etc_fd
+                )
+                try:
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view):]
+                    os.fchmod(fd, mode)
+                finally:
+                    os.close(fd)
+            os.rename(tmp_name, name, src_dir_fd=etc_fd, dst_dir_fd=etc_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp_name, dir_fd=etc_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(etc_fd)
+
+
+def _jail_etc_lstat(jail_root, name):
+    """os.stat_result of `<jail_root>/etc/<name>` itself (a link is not followed), or None when
+    nothing is there. `etc` that is not a directory raises OSError."""
+    etc_fd = _jail_etc_fd(jail_root)
+    try:
+        try:
+            return os.stat(name, dir_fd=etc_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+    finally:
+        os.close(etc_fd)
+
+
+def jail_etc_kind(jail_root, name):
+    """'absent', 'file' or 'other' (a link, a FIFO, a directory) for `<jail_root>/etc/<name>`,
+    without following a link (the internal development record). `etc` that is not a directory raises OSError."""
+    st = _jail_etc_lstat(jail_root, name)
+    if st is None:
+        return 'absent'
+    return 'file' if stat.S_ISREG(st.st_mode) else 'other'
+
+
+def replace_in_jail_etc_file(jail_root, name, old, new):
+    """
+    Replace the text `old` by `new` in `<jail_root>/etc/<name>`, a file of the jail, from the host.
+
+    The file is read and replaced through read_/write_jail_etc_file, so a link left in its place
+    is neither read nor written through; an in-place edit by path (fileinput, open) copied a
+    linked host file's text into the jail (the internal development record). The other bytes and the mode are
+    kept. The result is 'written', 'unchanged', 'absent', or 'not-a-file' when something other
+    than a plain file is there, which is left alone. `etc` that is not a directory raises OSError.
+    """
+    st = _jail_etc_lstat(jail_root, name)
+    if st is None:
+        return 'absent'
+    if not stat.S_ISREG(st.st_mode):
+        return 'not-a-file'
+    data = read_jail_etc_file(jail_root, name, binary=True)
+    if data is None:
+        # Something else took its place since the stat.
+        return 'not-a-file'
+    replaced = data.replace(old.encode(), new.encode())
+    if replaced == data:
+        return 'unchanged'
+    write_jail_etc_file(jail_root, name, data=replaced, mode=stat.S_IMODE(st.st_mode))
+    return 'written'
+
+
+def _rc_conf_assignment(line):
+    """
+    (name, value) when an rc.conf line (bytes) assigns a variable the way
+    iocage has always read these files: not a comment, the name before the
+    first `=`, the value after it without quote characters. None otherwise.
+    The line is only split, never evaluated.
+    """
+    stripped = line.strip()
+    if stripped.startswith(b'#') or b'=' not in stripped:
+        return None
+    name, value = stripped.split(b'=', 1)
+    return name.strip(), value.strip().replace(b"'", b'').replace(b'"', b'')
+
+
+def edit_jail_rc_conf(jail_root, name='rc.conf', set_values=None,
+                      remove_if=None, create=True):
+    """
+    Edit `<jail_root>/etc/<name>`, an rc.conf of the jail, from the host.
+
+    `set_values` maps a variable to the value it gets. `remove_if` maps a
+    variable to a value: the variable is removed when that is what it is
+    set to. The result is 'written', 'unchanged', or 'not-a-file' when
+    something other than a plain file is there (a link, a FIFO, a
+    directory), which is left alone.
+
+    The file belongs to root in the jail, so it is handled as text and
+    never as shell. `sysrc -f` sources the file it is given, which ran the
+    jail's rc.conf as root on the host at every start, and both sysrc and
+    an open() by path write through a link left in the file's place
+    (the internal development record). Here it is read and replaced with
+    read_/write_jail_etc_file; lines that are not touched keep their bytes.
+
+    An absent file is created when `create` is true and is a
+    FileNotFoundError otherwise. `etc` that is not a directory raises
+    OSError, as in the helpers.
+    """
+    st = _jail_etc_lstat(jail_root, name)
+    if st is None:
+        if not create:
+            raise FileNotFoundError(
+                errno.ENOENT, os.strerror(errno.ENOENT),
+                os.path.join(jail_root, 'etc', name)
+            )
+        data, mode = b'', 0o644
+    elif not stat.S_ISREG(st.st_mode):
+        return 'not-a-file'
+    else:
+        data = read_jail_etc_file(jail_root, name, binary=True)
+        if data is None:
+            # Something else took its place since the stat.
+            return 'not-a-file'
+        mode = stat.S_IMODE(st.st_mode)
+
+    lines = data.split(b'\n')
+    if lines[-1] == b'':
+        lines.pop()
+    changed = st is None
+
+    def assigned(variable):
+        return [
+            (i, found[1])
+            for i, found in enumerate(map(_rc_conf_assignment, lines))
+            if found is not None and found[0] == variable
+        ]
+
+    for variable, value in (remove_if or {}).items():
+        found = assigned(variable.encode())
+        if found and found[-1][1] == value.encode():
+            for i, _ in reversed(found):
+                del lines[i]
+            changed = True
+
+    for variable, value in (set_values or {}).items():
+        found = assigned(variable.encode())
+        if found and found[-1][1] == value.encode():
+            continue
+        line = b'%s="%s"' % (variable.encode(), value.encode())
+        if found:
+            lines[found[-1][0]] = line
+        else:
+            lines.append(line)
+        changed = True
+
+    if not changed:
+        return 'unchanged'
+
+    write_jail_etc_file(
+        jail_root, name, data=b''.join(line + b'\n' for line in lines),
+        mode=mode
+    )
+    return 'written'
+
+
 def get_nested_key(_dict, keys=None):
     """Gets a nested key from a dictionary."""
 
@@ -626,46 +905,19 @@ def checkoutput(*args, **kwargs):
 
 
 def set_rcconf(jail_path, key, value):
-    conf_file = f"{jail_path}/root/etc/rc.conf"
-
-    found = False
-    changed = False
-
-    with open(conf_file, "r+") as f:
-
-        output = []
-
-        lines = f.read().splitlines()
-
-        for line in lines:
-
-            try:
-                current_key, current_value = line.split("=", 1)
-                current_value = current_value.strip("\"")
-            except ValueError:
-                output.append(line)
-
-                continue
-
-            if current_key == key:
-                found = True
-
-                if current_value != value:
-                    changed = True
-                    output.append(f"{key}=\"{value}\"")
-
-                    continue
-
-            output.append(line)
-
-        if not found:
-            output.append(f"{key}=\"{value}\"")
-            changed = True
-
-        if changed:
-            f.seek(0)
-            f.write("\n".join(output) + "\n")
-            f.truncate()
+    """
+    Set `key` in the jail's etc/rc.conf. The file is edited as text with
+    edit_jail_rc_conf, never through a link (the internal development record); one that
+    is not a plain file is left alone with a warning.
+    """
+    if edit_jail_rc_conf(
+        f'{jail_path}/root', 'rc.conf', set_values={key: value}, create=False
+    ) == 'not-a-file':
+        logit({
+            'level': 'WARNING',
+            'message': f'{jail_path}/root/etc/rc.conf not updated: it is'
+                       ' not a plain file'
+        })
 
 
 def parse_latest_release():
@@ -686,11 +938,14 @@ def parse_latest_release():
         # We want a dynamic supported
         try:
             if "releng/" in rel[1]:
-                rel = rel[1].strip('</td').strip("releng/")
+                rel = rel[1].strip('</td').strip('</p').strip("releng/")
+                float(rel)
 
                 if rel not in sup_releases:
                     sup_releases.append(rel)
         except IndexError:
+            pass
+        except ValueError:
             pass
 
     latest = f"{sorted(sup_releases)[-1]}-RELEASE"
@@ -765,7 +1020,7 @@ def generate_devfs_ruleset(conf, paths=None, includes=None, callback=None,
         if int(configured_ruleset) != 0 and int(configured_ruleset) not in ruleset_list:
             return True, configured_ruleset, '-1'
         rules = su.run(
-            ['devfs', 'rule', '-s', configured_ruleset, 'show'],
+            ['devfs', 'rule', '-s', str(configured_ruleset), 'show'],
             stdout=su.PIPE, universal_newlines=True
         )
         for rule in rules.stdout.splitlines():
@@ -920,7 +1175,14 @@ def consume_and_log(exec_gen, log=True, callback=None):
 
         stdout, stderr = append_and_log([stdout, stderr])
 
-    append_and_log([stdout, stderr])
+    # the internal development record: a last line without a trailing newline is output too;
+    # append_and_log() only takes complete lines, so it used to be dropped.
+    for i, v in enumerate(append_and_log([stdout, stderr])):
+        if v:
+            (error_list if i else output_list).append(v)
+            if log:
+                logit({'level': 'INFO', 'message': v.rstrip()},
+                      _callback=callback)
 
     return {'stdout': output_list, 'stderr': error_list}
 
@@ -1021,9 +1283,9 @@ def gen_nat_ip(ip_prefix):
     inuse = get_used_ips()
 
     for i in range(256):
-        for l in range(1, 256, 4):
+        for j in range(1, 256, 4):
             network = ipaddress.IPv4Network(
-                f'{ip_prefix}.{i}.{l}/30', strict=False
+                f'{ip_prefix}.{i}.{j}/30', strict=False
             )
             pair = [_ip.exploded for _ip in network.hosts()]
 
@@ -1086,6 +1348,7 @@ def parse_package_name(pkg):
     revision_split = epoch_split[0].rsplit('_', 1)
     revision = \
         revision_split[1] if len(revision_split) == 2 else '0'
+    revision = revision.replace(".txz", "")
     return {
         'version': revision_split[0],
         'revision': revision,
@@ -1093,31 +1356,67 @@ def parse_package_name(pkg):
     }
 
 
-def get_host_gateways():
+def get_host_gateways(fib=0):
     gateways = {'ipv4': {'gateway': None, 'interface': None},
                 'ipv6': {'gateway': None, 'interface': None}}
     af_mapping = {
         'Internet': 'ipv4',
         'Internet6': 'ipv6'
     }
-    output = checkoutput(['netstat', '-r', '-n', '--libxo', 'json'])
-    route_families = (json.loads(output)
-                      ['statistics']
-                      ['route-information']
-                      ['route-table']
-                      ['rt-family'])
-    for af in af_mapping.keys():
-        route_entries = list(filter(
-            lambda x: x['address-family'] == af, route_families)
-        )[0]['rt-entry']
-        default_route = list(filter(
-            lambda x: x['destination'] == 'default', route_entries)
-        )
-        if default_route and 'gateway' in default_route[0]:
-            gateways[af_mapping[af]]['gateway'] = \
-                default_route[0]['gateway']
-            gateways[af_mapping[af]]['interface'] = \
-                default_route[0]['interface-name']
+    output = checkoutput([
+        'setfib', f'{fib}', 'netstat', '-r', '-n', '--libxo', 'json'
+    ])
+    route_data = json.loads(output)
+    if not isinstance(route_data, dict):
+        return gateways
+
+    statistics = route_data.get('statistics')
+    if not isinstance(statistics, dict):
+        return gateways
+
+    route_information = statistics.get('route-information')
+    if not isinstance(route_information, dict):
+        return gateways
+
+    route_tables = route_information.get('route-table')
+    if isinstance(route_tables, dict):
+        route_tables = [route_tables]
+    elif not isinstance(route_tables, list):
+        route_tables = []
+
+    route_families = []
+    for route_table in route_tables:
+        if not isinstance(route_table, dict):
+            continue
+        families = route_table.get('rt-family')
+        if isinstance(families, dict):
+            route_families.append(families)
+        elif isinstance(families, list):
+            route_families.extend(families)
+
+    for route_family in route_families:
+        if not isinstance(route_family, dict):
+            continue
+        address_family = af_mapping.get(route_family.get('address-family'))
+        if not address_family:
+            continue
+
+        route_entries = route_family.get('rt-entry')
+        if isinstance(route_entries, dict):
+            route_entries = [route_entries]
+        elif not isinstance(route_entries, list):
+            route_entries = []
+
+        for route_entry in route_entries:
+            if not isinstance(route_entry, dict) or \
+                    route_entry.get('destination') != 'default':
+                continue
+            gateway = route_entry.get('gateway')
+            if gateway is not None:
+                gateways[address_family]['gateway'] = gateway
+                gateways[address_family]['interface'] = \
+                    route_entry.get('interface-name')
+                break
     return gateways
 
 
@@ -1129,33 +1428,44 @@ def get_active_jails():
     }
 
 
-def validate_plugin_manifest(manifest, _callback, silent):
+def validate_plugin_manifest(manifest, _callback, silent, fatal=True):
+    """
+    the internal development record: the 15.0 plugin store's manifest rules. A missing
+    required key or a malformed devfs_ruleset stops (as the TrueNAS fork
+    did); any other schema difference -- string-typed "official" or
+    "revision" fields as the published catalog writes them -- is a warning,
+    or a plugin from the live catalog could not be installed.
+    the internal development record already made the start path warn only (fatal=False).
+    """
+    v = jsonschema.Draft7Validator(cache.plugin_manifest_schema)
+
     errors = []
-    for k in (
-        'name', 'release', 'pkgs', 'packagesite', 'fingerprints', 'artifact',
-    ):
-        if k not in manifest:
-            errors.append(f'Missing "{k}" key in manifest')
+    warnings = []
+    for e in v.iter_errors(manifest):
+        path = list(e.absolute_path)
+        structural = (
+            (e.validator == 'required' and not path) or
+            (path and path[0] == 'devfs_ruleset')
+        )
+        (errors if structural else warnings).append(e.message)
 
-    if 'devfs_ruleset' in manifest:
-        if not isinstance(manifest['devfs_ruleset'], dict):
-            errors.append('"devfs_ruleset" must be a dictionary')
-        else:
-            devfs_ruleset = manifest['devfs_ruleset']
-            if 'paths' not in devfs_ruleset:
-                errors.append('Key "paths" not specified in devfs_ruleset')
-            elif not isinstance(devfs_ruleset['paths'], dict):
-                errors.append('"devfs_ruleset.paths" should be a valid dictionary')
-
-            if 'includes' in devfs_ruleset and not isinstance(devfs_ruleset['includes'], list):
-                errors.append('"devfs_ruleset.includes" should be a valid list')
+    if warnings:
+        logit(
+            {
+                'level': 'WARNING',
+                'message': 'The plugin manifest differs from the schema:\n'
+                           + '\n'.join(warnings)
+            },
+            _callback=_callback,
+            silent=silent,
+        )
 
     if errors:
         errors = '\n'.join(errors)
         logit(
             {
-                'level': 'EXCEPTION',
-                'msg': f'The Following errors were encountered with plugin manifest:\n{errors}'
+                'level': 'EXCEPTION' if fatal else 'WARNING',
+                'message': f'The Following errors were encountered with plugin manifest:\n{errors}'
             },
             _callback=_callback,
             silent=silent,
@@ -1167,7 +1477,7 @@ def retrieve_ip4_for_jail(conf, jail_running):
     if iocage_lib.ioc_common.check_truthy(conf['dhcp']) and jail_running and os.geteuid() == 0:
         interface = conf['interfaces'].split(',')[0].split(':')[0]
 
-        if interface == 'vnet0':
+        if 'vnet' in interface:
             # Inside jails they are epairNb
             interface = f"{interface.replace('vnet', 'epair')}b"
 
@@ -1178,8 +1488,9 @@ def retrieve_ip4_for_jail(conf, jail_running):
         ]
         try:
             out = su.check_output(full_ip4_cmd)
-            full_ip4 = f'{interface}|{out.splitlines()[2].split()[1].decode()}'
-        except (su.CalledProcessError, IndexError) as e:
+            address, _ = parse_dhcp_address(out)
+            full_ip4 = f'{interface}|{address}'
+        except (su.CalledProcessError, ValueError) as e:
             short_ip4 += '(Network Issue)'
             if isinstance(e, su.CalledProcessError):
                 full_ip4 = f'DHCP - Network Issue: {e}'
@@ -1240,29 +1551,12 @@ def retrieve_admin_portals(
         # only the first ip if it changes address - if we hardcode, that would mean applying
         # the firewall rules again on ip changes
         nat_iface = conf.get('nat_interface', 'none')
-        all_ips = []
-        ipv4_interface = None
-        if nat_iface == 'none' and default_gateways['ipv4']['interface']:
-            ipv4_interface = default_gateways['ipv4']['interface']
-        elif nat_iface in netifaces.interfaces():
-            ipv4_interface = nat_iface
-
-        if ipv4_interface:
-            all_ips.extend(iface_addresses(ipv4_interface))
-
-        if all_ips:
-            all_ips = [i['addr'] for i in sorted(all_ips, key=lambda o: not o['carp_ip'])]
-        elif nat_iface == 'none' or nat_iface in netifaces.interfaces():
-            if nat_iface == 'none' and not default_gateways['ipv6']['interface']:
-                all_ips = []
-            else:
-                # We did not get a ipv4 address, falling back to ipv6
-                all_ips = [
-                    f['addr']
-                    for f in netifaces.ifaddresses(
-                        default_gateways['ipv6']['interface'] if nat_iface == 'none' else nat_iface
-                    ).get(netifaces.AF_INET6, [])
-                ]
+        all_ips = [
+            f['addr'] for k in default_gateways if default_gateways[k]['interface']
+            for f in netifaces.ifaddresses(
+                default_gateways[k]['interface'] if nat_iface == 'none' else nat_iface
+            )[netifaces.AF_INET if k == 'ipv4' else netifaces.AF_INET6]
+        ] if nat_iface in netifaces.interfaces() or nat_iface == 'none' else []
         if all_ips:
             all_ips = [all_ips[0]]
 
@@ -1316,28 +1610,3 @@ def tmp_dataset_checks(_callback, silent):
                 _callback=_callback,
                 silent=silent
             )
-
-
-def default_gateway_addresses():
-    default_gw_iface = get_host_gateways()['ipv4']['interface']
-    addresses = []
-    if default_gw_iface:
-        addresses.extend(iface_addresses(default_gw_iface))
-
-    return addresses
-
-
-def iface_addresses(iface_name):
-    addresses = []
-    try:
-        iface = netif.get_interface(iface_name)
-    except KeyError:
-        return addresses
-
-    for addr in filter(lambda i: isinstance(i.address, ipaddress.IPv4Address), iface.addresses):
-        addresses.append({
-            'addr': addr.address.exploded,
-            'broadcast': addr.broadcast.exploded,
-            'carp_ip': bool(addr.vhid),
-        })
-    return addresses

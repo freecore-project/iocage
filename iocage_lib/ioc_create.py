@@ -38,12 +38,9 @@ import iocage_lib.ioc_list
 import iocage_lib.ioc_start
 import iocage_lib.ioc_stop
 import iocage_lib.ioc_exceptions
-import dns.resolver
-import dns.exception
 import shutil
 
 from iocage_lib.cache import cache
-from iocage_lib.create_utils import strip_jail_for_base_jail
 from iocage_lib.dataset import Dataset
 
 
@@ -603,13 +600,22 @@ class IOCCreate(object):
                     for line in _clone_fstab.readlines():
                         _fstab.write(line.replace(clone_uuid, jail_uuid))
 
-            with open(clone_etc_hosts, "r") as _clone_etc_hosts:
-                with iocage_lib.ioc_common.open_atomic(
-                        clone_etc_hosts, "w") as etc_hosts:
-                    # open_atomic will empty the file, we need these still.
-
-                    for line in _clone_etc_hosts.readlines():
-                        etc_hosts.write(line.replace(clone_uuid, jail_uuid))
+            # the internal development record: the clone's etc/hosts is its source's; a link there is
+            # neither read nor replaced.
+            try:
+                iocage_lib.ioc_common.replace_in_jail_etc_file(
+                    os.path.dirname(os.path.dirname(clone_etc_hosts)), 'hosts',
+                    clone_uuid, jail_uuid
+                )
+            except OSError as e:
+                iocage_lib.ioc_common.logit({
+                    'level': 'WARNING',
+                    'message': f'{clone_etc_hosts} not updated: the jail\'s'
+                               f' root/etc is not a plain directory'
+                               f' ({e.strerror})'
+                },
+                    _callback=self.callback,
+                    silent=self.silent)
 
         if not self.empty:
             self.create_rc(
@@ -623,7 +629,36 @@ class IOCCreate(object):
                     location, "rtsold_enable", rtsold_enable)
 
         if self.basejail or self.plugin:
-            iocjson.json_write(strip_jail_for_base_jail(config, self.release, self.iocroot, jail_uuid))
+            basedirs = ["bin", "boot", "lib", "libexec", "rescue", "sbin",
+                        "usr/bin", "usr/include", "usr/lib",
+                        "usr/libexec", "usr/sbin", "usr/share",
+                        "usr/libdata", "usr/lib32"]
+
+            if "-STABLE" in self.release:
+                # HardenedBSD does not have this.
+                basedirs.remove("usr/lib32")
+
+            for bdir in basedirs:
+                if "-RELEASE" not in self.release and "-STABLE" not in \
+                        self.release:
+                    _type = "templates"
+                else:
+                    _type = "releases"
+
+                source = f"{self.iocroot}/{_type}/{self.release}/root/{bdir}"
+                destination = f"{self.iocroot}/jails/{jail_uuid}/root/{bdir}"
+
+                # This reduces the REFER of the basejail.
+                # Just much faster by almost a factor of 2 than the builtins.
+                su.Popen(["rm", "-r", "-f", destination]).communicate()
+                os.mkdir(destination)
+
+                iocage_lib.ioc_fstab.IOCFstab(jail_uuid, "add", source,
+                                              destination, "nullfs", "ro", "0",
+                                              "0", silent=True)
+                config["basejail"] = 1
+
+            iocjson.json_write(config)
 
         if not self.plugin:
             if self.clone:
@@ -735,6 +770,8 @@ class IOCCreate(object):
                 _callback=self.callback,
                 silent=False)
 
+            import dns.resolver
+            import dns.exception
             try:
                 dns.resolver.query(repo)
             except dns.resolver.NoNameservers:
@@ -930,10 +967,13 @@ class IOCCreate(object):
                         iocage_lib.ioc_common.consume_and_log(
                             _exec,
                             callback=self.callback,
-                            log=not(self.silent)
+                            log=not (self.silent)
                         )
                 except iocage_lib.ioc_exceptions.CommandFailed as e:
-                    pkg_stderr = e.message[-1].decode().rstrip()
+                    nonempty_lines = [line.rstrip() for line in e.message if line.rstrip()]
+                    pkg_stderr = ''
+                    if len(nonempty_lines) > 0:
+                        pkg_stderr = nonempty_lines[-1].decode()
                     pkg_err = True
 
                 if not pkg_err:
@@ -1004,8 +1044,23 @@ ipv6_activate_all_interfaces=\"YES\"
 """
             rc_conf.write_text(rcconf)
 
-        if not jail_rc_conf.is_file():
-            shutil.copy(str(rc_conf), str(jail_rc_conf))
+        # the internal development record: a clone's root is its source's, links and all. The default rc.conf
+        # is written only where there is none, and never through a link.
+        try:
+            if iocage_lib.ioc_common.jail_etc_kind(
+                f'{location}/root', 'rc.conf'
+            ) == 'absent':
+                iocage_lib.ioc_common.write_jail_etc_file(
+                    f'{location}/root', 'rc.conf', data=rc_conf.read_bytes()
+                )
+        except OSError as e:
+            iocage_lib.ioc_common.logit({
+                'level': 'WARNING',
+                'message': f'{jail_rc_conf} not written: the jail\'s root/etc'
+                           f' is not a plain directory ({e.strerror})'
+            },
+                _callback=self.callback,
+                silent=self.silent)
 
         if basejail:
             su.Popen(
