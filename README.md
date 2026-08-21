@@ -1,157 +1,48 @@
 # iocage
 
-[![Average time to resolve an issue](http://isitmaintained.com/badge/resolution/freebsd/iocage.svg)](http://isitmaintained.com/project/freebsd/iocage "Average time to resolve an issue")
-[![Percentage of issues still open](http://isitmaintained.com/badge/open/freebsd/iocage.svg)](http://isitmaintained.com/project/freebsd/iocage "Percentage of issues still open")
-![Python Version](https://img.shields.io/badge/Python-3.11-blue.svg)
-[![GitHub issues](https://img.shields.io/github/issues/freebsd/iocage.svg)](https://github.com/freebsd/iocage/issues)
-[![GitHub forks](https://img.shields.io/github/forks/freebsd/iocage.svg)](https://github.com/freebsd/iocage/network)
-[![GitHub stars](https://img.shields.io/github/stars/freebsd/iocage.svg)](https://github.com/freebsd/iocage/stargazers)
-[![Twitter](https://img.shields.io/twitter/url/https/github.com/freebsd/iocage.svg?style=social)](https://twitter.com/intent/tweet?text=@iocage)
+[FreeCORE](https://freecore.org) carries the TrueNAS CORE 13.3 system forward as an
+independently maintained operating system on FreeBSD. TrueNAS CORE 13.3 systems
+upgrade straight to FreeCORE 15.0 in place, then continue on the project’s
+update train.
 
-## A FreeBSD jail manager
+Not affiliated with or endorsed by iXsystems, Inc.
 
-iocage is a jail/container manager amalgamating some of the best features and
-technologies the FreeBSD operating system has to offer. It is geared for ease
- of use with a simple and easy to understand command syntax.
+## What this repository is
 
-iocage is in the FreeBSD ports tree as sysutils/py-iocage.
-To install using binary packages, simply run: `pkg install sysutils/iocage`
+`iocage` forked from [`truenas/iocage`](https://github.com/truenas/iocage) at:
 
-## Installation
+| | |
+|---|---|
+| **Base commit** | `93f041a73edc5e2e08c092e3fa569d86c037712b` |
+| **Base** | truenas/13.3-u1-stable @ 2024-11-18 |
+| **Licence** | BSD-2-Clause — unchanged from upstream |
 
-### GitHub:
+## How to read the history
 
-The FreeBSD source tree ***must*** be located at `$SRC_BASE` (`/usr/src` by default) to build from git.
+Upstream history is preserved verbatim below the base commit: original commits,
+original authors, original dates. Everything FreeCORE changed sits above it.
 
-- `pkg install python3 git-lite lang/cython3 devel/py-pip`
-- `git clone https://github.com/freebsd/iocage`
-- `make install` as root
-
-To install subsequent updates: run `make install` as root.
-
-### Ports:
-
-- Build the port as follows: `cd /usr/ports/sysutils/iocage/ ; make install clean`
-
-### Pkg:
-
-- It is possible to install pre-built packages using pkg(8) if you are using FreeBSD 10 or above: `pkg install sysutils/iocage`
-
-#### Upgrading from `iocage_legacy`:
-
-This repository replaces `iocage_legacy`. To upgrade to the current version:
-
-1. Stop the jails (`service iocage stop; iocage stop ALL`)
-1. Back up your data
-1. Remove the old `iocage` package if it is installed (`pkg delete iocage`)
-1. Install `iocage` using one of the methods above
-1. Migrate the jails. This can be done by running `iocage list` as root
-1. Start the jails (`service iocage onestart`)
-
-## Links
-
-- **[iocage Project Website](https://freebsd.github.io/iocage/)**
-
-## WARNING:
-- Some features of the previous iocage_legacy are either being dropped or simply not ported yet, feel free to open an issue asking about your favorite feature. But please search before opening a new one. PR's welcome for any feature you want!
-
-## Raising an issue:
-
-We _like_ issues! If you are having trouble with `iocage` please open a GitHub [issue](https://github.com/freebsd/iocage/issues) and we will ~~run around with our hair on fire~~ look into it. Before doing so, please give us some information about the situation:
-
-- Tell us what version of FreeBSD you are using with something like `uname -ro`
-- It would also be helpful if you gave us the output of `iocage --version`
-- Most importantly, try to be detailed. Simply stating "I tried consoling into a jail and it broke" will not help us very much.
-- Use the [Markdown Basics](https://help.github.com/articles/markdown-basics/#code-formatting) GitHub page for more information on how to paste lines of code and terminal output.
-
-## Submitting a pull request:
-
-Please be detailed on the exact use case of your change and a short demo of
-it. Make sure it conforms with PEP-8 and that you supply a test with it if
-relevant. Lines may not be longer then 80 characters.
-
-## FEATURES
-
-- Ease of use
-- Rapid jail creation within seconds
-- Automatic package installation
-- Virtual networking stacks (vnet)
-- Shared IP based jails (non vnet)
-- Transparent ZFS snapshot management
-- Export and import
-- And many more!
-
-----
-
-## QUICK HOWTO
-
-Activate a zpool:
-
-`iocage activate ZPOOL`
-
-*NOTE: ZPOOL is a placeholder. Use `zpool list` and substitute it for the
-zpool you wish to use.*
-
-Fetch a release:
-
-`iocage fetch`
-
-Create a jail:
-
-`iocage create -n myjail ip4_addr="em0|192.168.1.10/24" -r 11.0-RELEASE`
-
-*NOTE: em0 and 11.0-RELEASE are placeholders. Please replace them with your
-real interface (`ifconfig`) and RELEASE chosen during `iocage fetch`.*
-
-Start the jail:
-
-`iocage start myjail`
-
-Congratulations, you have created your first jail with iocage!
-You can now use it like you would a real system.
-Since SSH won't be available by default, `iocage console myjail` is a useful
-spot to begin configuration of your jail.
-
-To see a list of commands available to you now, type `iocage` outside the jail.
-
-----
-
-### REQUIREMENTS
-
-- FreeBSD 11.4-RELEASE amd64 and higher or HardenedBSD/TrueOS
-- ZFS file system
-- Python 3.8+
-- UTF-8 locale (place into your ~/.login_conf):
-
-```plain
-me:\
-        :charset=UTF-8:\
-        :lang=en_US.UTF-8:\
-        :setenv=LC_COLLATE=C:
+```sh
+git log --oneline 93f041a73edc..HEAD      # the entire FreeCORE delta
+git diff 93f041a73edc..HEAD               # ...as one diff
 ```
 
-### Optional
+The FreeCORE commits are a compact **release history**, generated from the
+reviewed source-state difference rather than copied from the development
+repositories. Private commit subjects, issue references, dates, and intermediate
+churn are not mirrored here. Only tagged release commits are states that were
+built and tested.
 
-- Kernel compiled with:
+## Releases
 
-        # This is optional and only needed if you need VNET
+Tags mark states that were actually built, installed and validated.
 
-        options         VIMAGE # VNET/Vimage support
+## Contributing
 
-### Helpful Considerations
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security reports go to
+security@freecore.org, not to the issue tracker — see [SECURITY.md](SECURITY.md).
 
-- For the explanations on jail properties read jail(8)
-- Create bridge0 and bridge1 interfaces for VNET jails to attach to.
-- Use `iocage set` to modify properties and `iocage get` to retrieve property
- values
-- Type `iocage COMMAND --help` to see any flags the command supports and their help, for example:
+## Licence and attribution
 
-        iocage create --help
-        iocage fetch --help
-        iocage list --help
-- If using VNET consider adding the following to `/etc/sysctl.conf` on the host:
-
-        net.inet.ip.forwarding=1       # Enable IP forwarding between interfaces
-        net.link.bridge.pfil_onlyip=0  # Only pass IP packets when pfil is enabled
-        net.link.bridge.pfil_bridge=0  # Packet filter on the bridge interface
-        net.link.bridge.pfil_member=0  # Packet filter on the member interface
+See [NOTICE](NOTICE) and [TRADEMARKS.md](TRADEMARKS.md). Nothing here is
+relicensed; upstream copyright notices and licence texts are preserved.
