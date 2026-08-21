@@ -31,12 +31,13 @@ import shutil
 import stat
 import subprocess as su
 import tempfile as tmp
+
+import jsonschema
 import requests
 import datetime as dt
 import re
 import shlex
 import glob
-import netif
 import netifaces
 import concurrent.futures
 import json
@@ -44,6 +45,7 @@ import urllib.parse
 
 import iocage_lib.ioc_exceptions
 import iocage_lib.ioc_exec
+from iocage_lib.cache import cache
 
 from iocage_lib.dataset import Dataset
 
@@ -81,7 +83,7 @@ def callback(_log, callback_exception):
         else:
             if not isinstance(message, str) and isinstance(
                 message,
-                collections.Iterable
+                collections.abc.Iterable
             ):
                 message = '\n'.join(message)
 
@@ -119,6 +121,33 @@ def try_convert(value, default, *types):
             continue
 
     return default
+
+
+def parse_dhcp_address(ifconfig_output):
+    """Return the IPv4 address and prefix length from ifconfig output."""
+    if isinstance(ifconfig_output, bytes):
+        ifconfig_output = ifconfig_output.decode('utf-8')
+
+    for line in ifconfig_output.splitlines():
+        fields = line.split()
+        if not fields or fields[0] != 'inet':
+            continue
+
+        try:
+            address = fields[1]
+            netmask = fields[fields.index('netmask') + 1]
+            ipaddress.IPv4Address(address)
+            if netmask.lower().startswith('0x'):
+                netmask = str(ipaddress.IPv4Address(int(netmask, 16)))
+            prefix_length = ipaddress.IPv4Network(
+                f'0.0.0.0/{netmask}'
+            ).prefixlen
+        except (IndexError, ValueError) as e:
+            raise ValueError('Malformed IPv4 inet address') from e
+
+        return address, prefix_length
+
+    raise ValueError('No IPv4 inet address found')
 
 
 def raise_sort_error(sort_list):
@@ -186,6 +215,8 @@ def ioc_sort(caller, s_type, data=None):
 def get_natural_sortkey(text):
     # attempt to convert str to int to facilitate simplified natural sorting
     # integers will be ranked before alphanumerical values
+    if text is None:
+        return 30, None
     try:
         return 10, int(text)
     except ValueError:
@@ -412,30 +443,7 @@ def sort_release(releases, split=False, fetch_releases=False):
     release_list = []
     list_sort = False
 
-    try:
-        # Length 9 (standard) or 10 (plugins) is list -l,
-        # Length 5 is list
-
-        length = len(releases)
-
-        if fetch_releases:
-            pass
-        elif length == 9 or length == 10:
-            # Attempt to split off the -p* stuff.
-            try:
-                _release, _patch = releases[5].rsplit("-p", 1)
-            except ValueError:
-                _release = releases[5]
-                _patch = 0
-            list_sort = True
-        elif length == 5:
-            _release = releases[3]
-            _patch = 0
-            list_sort = True
-    except TypeError:
-        # This is list -r
-        pass
-
+    # This is list -r
     if split:
         for i, rel in enumerate(releases):
             try:
@@ -457,6 +465,25 @@ def sort_release(releases, split=False, fetch_releases=False):
             # enumeration ensures 11.2-LOCAL does not take the place of 11.2-R
             r_dict[f'{rel}_{i}'] = r_type
     else:
+        # Length 9 (standard) or 10 (plugins) is list -l,
+        # Length 5 is list
+
+        length = len(releases)
+
+        if fetch_releases:
+            pass
+        elif length == 9 or length == 10:
+            # Attempt to split off the -p* stuff.
+            try:
+                _release, _patch = releases[5].rsplit("-p", 1)
+            except ValueError:
+                _release = releases[5]
+                _patch = 0
+            list_sort = True
+        elif length == 5:
+            _release = releases[3]
+            _patch = 0
+            list_sort = True
         if list_sort:
             _release = _release.split("-", 1)
             try:
@@ -483,19 +510,16 @@ def sort_release(releases, split=False, fetch_releases=False):
                     pass
 
     ordered_r_dict = collections.OrderedDict(sorted(r_dict.items()))
-    index = 0
 
     for r, t in ordered_r_dict.items():
         if split:
             r = r.rsplit('_')[0]  # Remove the enumeration
             if t:
-                release_list.insert(index, [f"{r}-{t}"])
+                release_list.append([f"{r}-{t}"])
             else:
-                release_list.insert(index, [r])
-            index += 1
+                release_list.append([r])
         else:
-            release_list.insert(index, f"{r}-{t}")
-            index += 1
+            release_list.append(f"{r}-{t}")
 
     return release_list
 
@@ -686,11 +710,14 @@ def parse_latest_release():
         # We want a dynamic supported
         try:
             if "releng/" in rel[1]:
-                rel = rel[1].strip('</td').strip("releng/")
+                rel = rel[1].strip('</td').strip('</p').strip("releng/")
+                float(rel)
 
                 if rel not in sup_releases:
                     sup_releases.append(rel)
         except IndexError:
+            pass
+        except ValueError:
             pass
 
     latest = f"{sorted(sup_releases)[-1]}-RELEASE"
@@ -765,7 +792,7 @@ def generate_devfs_ruleset(conf, paths=None, includes=None, callback=None,
         if int(configured_ruleset) != 0 and int(configured_ruleset) not in ruleset_list:
             return True, configured_ruleset, '-1'
         rules = su.run(
-            ['devfs', 'rule', '-s', configured_ruleset, 'show'],
+            ['devfs', 'rule', '-s', str(configured_ruleset), 'show'],
             stdout=su.PIPE, universal_newlines=True
         )
         for rule in rules.stdout.splitlines():
@@ -1021,9 +1048,9 @@ def gen_nat_ip(ip_prefix):
     inuse = get_used_ips()
 
     for i in range(256):
-        for l in range(1, 256, 4):
+        for j in range(1, 256, 4):
             network = ipaddress.IPv4Network(
-                f'{ip_prefix}.{i}.{l}/30', strict=False
+                f'{ip_prefix}.{i}.{j}/30', strict=False
             )
             pair = [_ip.exploded for _ip in network.hosts()]
 
@@ -1086,6 +1113,7 @@ def parse_package_name(pkg):
     revision_split = epoch_split[0].rsplit('_', 1)
     revision = \
         revision_split[1] if len(revision_split) == 2 else '0'
+    revision = revision.replace(".txz", "")
     return {
         'version': revision_split[0],
         'revision': revision,
@@ -1093,31 +1121,67 @@ def parse_package_name(pkg):
     }
 
 
-def get_host_gateways():
+def get_host_gateways(fib=0):
     gateways = {'ipv4': {'gateway': None, 'interface': None},
                 'ipv6': {'gateway': None, 'interface': None}}
     af_mapping = {
         'Internet': 'ipv4',
         'Internet6': 'ipv6'
     }
-    output = checkoutput(['netstat', '-r', '-n', '--libxo', 'json'])
-    route_families = (json.loads(output)
-                      ['statistics']
-                      ['route-information']
-                      ['route-table']
-                      ['rt-family'])
-    for af in af_mapping.keys():
-        route_entries = list(filter(
-            lambda x: x['address-family'] == af, route_families)
-        )[0]['rt-entry']
-        default_route = list(filter(
-            lambda x: x['destination'] == 'default', route_entries)
-        )
-        if default_route and 'gateway' in default_route[0]:
-            gateways[af_mapping[af]]['gateway'] = \
-                default_route[0]['gateway']
-            gateways[af_mapping[af]]['interface'] = \
-                default_route[0]['interface-name']
+    output = checkoutput([
+        'setfib', f'{fib}', 'netstat', '-r', '-n', '--libxo', 'json'
+    ])
+    route_data = json.loads(output)
+    if not isinstance(route_data, dict):
+        return gateways
+
+    statistics = route_data.get('statistics')
+    if not isinstance(statistics, dict):
+        return gateways
+
+    route_information = statistics.get('route-information')
+    if not isinstance(route_information, dict):
+        return gateways
+
+    route_tables = route_information.get('route-table')
+    if isinstance(route_tables, dict):
+        route_tables = [route_tables]
+    elif not isinstance(route_tables, list):
+        route_tables = []
+
+    route_families = []
+    for route_table in route_tables:
+        if not isinstance(route_table, dict):
+            continue
+        families = route_table.get('rt-family')
+        if isinstance(families, dict):
+            route_families.append(families)
+        elif isinstance(families, list):
+            route_families.extend(families)
+
+    for route_family in route_families:
+        if not isinstance(route_family, dict):
+            continue
+        address_family = af_mapping.get(route_family.get('address-family'))
+        if not address_family:
+            continue
+
+        route_entries = route_family.get('rt-entry')
+        if isinstance(route_entries, dict):
+            route_entries = [route_entries]
+        elif not isinstance(route_entries, list):
+            route_entries = []
+
+        for route_entry in route_entries:
+            if not isinstance(route_entry, dict) or \
+                    route_entry.get('destination') != 'default':
+                continue
+            gateway = route_entry.get('gateway')
+            if gateway is not None:
+                gateways[address_family]['gateway'] = gateway
+                gateways[address_family]['interface'] = \
+                    route_entry.get('interface-name')
+                break
     return gateways
 
 
@@ -1129,33 +1193,44 @@ def get_active_jails():
     }
 
 
-def validate_plugin_manifest(manifest, _callback, silent):
+def validate_plugin_manifest(manifest, _callback, silent, fatal=True):
+    """
+    the internal development record: the 15.0 plugin store's manifest rules. A missing
+    required key or a malformed devfs_ruleset stops (as the TrueNAS fork
+    did); any other schema difference -- string-typed "official" or
+    "revision" fields as the published catalog writes them -- is a warning,
+    or a plugin from the live catalog could not be installed.
+    the internal development record already made the start path warn only (fatal=False).
+    """
+    v = jsonschema.Draft7Validator(cache.plugin_manifest_schema)
+
     errors = []
-    for k in (
-        'name', 'release', 'pkgs', 'packagesite', 'fingerprints', 'artifact',
-    ):
-        if k not in manifest:
-            errors.append(f'Missing "{k}" key in manifest')
+    warnings = []
+    for e in v.iter_errors(manifest):
+        path = list(e.absolute_path)
+        structural = (
+            (e.validator == 'required' and not path) or
+            (path and path[0] == 'devfs_ruleset')
+        )
+        (errors if structural else warnings).append(e.message)
 
-    if 'devfs_ruleset' in manifest:
-        if not isinstance(manifest['devfs_ruleset'], dict):
-            errors.append('"devfs_ruleset" must be a dictionary')
-        else:
-            devfs_ruleset = manifest['devfs_ruleset']
-            if 'paths' not in devfs_ruleset:
-                errors.append('Key "paths" not specified in devfs_ruleset')
-            elif not isinstance(devfs_ruleset['paths'], dict):
-                errors.append('"devfs_ruleset.paths" should be a valid dictionary')
-
-            if 'includes' in devfs_ruleset and not isinstance(devfs_ruleset['includes'], list):
-                errors.append('"devfs_ruleset.includes" should be a valid list')
+    if warnings:
+        logit(
+            {
+                'level': 'WARNING',
+                'message': 'The plugin manifest differs from the schema:\n'
+                           + '\n'.join(warnings)
+            },
+            _callback=_callback,
+            silent=silent,
+        )
 
     if errors:
         errors = '\n'.join(errors)
         logit(
             {
-                'level': 'EXCEPTION',
-                'msg': f'The Following errors were encountered with plugin manifest:\n{errors}'
+                'level': 'EXCEPTION' if fatal else 'WARNING',
+                'message': f'The Following errors were encountered with plugin manifest:\n{errors}'
             },
             _callback=_callback,
             silent=silent,
@@ -1167,7 +1242,7 @@ def retrieve_ip4_for_jail(conf, jail_running):
     if iocage_lib.ioc_common.check_truthy(conf['dhcp']) and jail_running and os.geteuid() == 0:
         interface = conf['interfaces'].split(',')[0].split(':')[0]
 
-        if interface == 'vnet0':
+        if 'vnet' in interface:
             # Inside jails they are epairNb
             interface = f"{interface.replace('vnet', 'epair')}b"
 
@@ -1178,8 +1253,9 @@ def retrieve_ip4_for_jail(conf, jail_running):
         ]
         try:
             out = su.check_output(full_ip4_cmd)
-            full_ip4 = f'{interface}|{out.splitlines()[2].split()[1].decode()}'
-        except (su.CalledProcessError, IndexError) as e:
+            address, _ = parse_dhcp_address(out)
+            full_ip4 = f'{interface}|{address}'
+        except (su.CalledProcessError, ValueError) as e:
             short_ip4 += '(Network Issue)'
             if isinstance(e, su.CalledProcessError):
                 full_ip4 = f'DHCP - Network Issue: {e}'
@@ -1240,29 +1316,12 @@ def retrieve_admin_portals(
         # only the first ip if it changes address - if we hardcode, that would mean applying
         # the firewall rules again on ip changes
         nat_iface = conf.get('nat_interface', 'none')
-        all_ips = []
-        ipv4_interface = None
-        if nat_iface == 'none' and default_gateways['ipv4']['interface']:
-            ipv4_interface = default_gateways['ipv4']['interface']
-        elif nat_iface in netifaces.interfaces():
-            ipv4_interface = nat_iface
-
-        if ipv4_interface:
-            all_ips.extend(iface_addresses(ipv4_interface))
-
-        if all_ips:
-            all_ips = [i['addr'] for i in sorted(all_ips, key=lambda o: not o['carp_ip'])]
-        elif nat_iface == 'none' or nat_iface in netifaces.interfaces():
-            if nat_iface == 'none' and not default_gateways['ipv6']['interface']:
-                all_ips = []
-            else:
-                # We did not get a ipv4 address, falling back to ipv6
-                all_ips = [
-                    f['addr']
-                    for f in netifaces.ifaddresses(
-                        default_gateways['ipv6']['interface'] if nat_iface == 'none' else nat_iface
-                    ).get(netifaces.AF_INET6, [])
-                ]
+        all_ips = [
+            f['addr'] for k in default_gateways if default_gateways[k]['interface']
+            for f in netifaces.ifaddresses(
+                default_gateways[k]['interface'] if nat_iface == 'none' else nat_iface
+            )[netifaces.AF_INET if k == 'ipv4' else netifaces.AF_INET6]
+        ] if nat_iface in netifaces.interfaces() or nat_iface == 'none' else []
         if all_ips:
             all_ips = [all_ips[0]]
 
@@ -1316,28 +1375,3 @@ def tmp_dataset_checks(_callback, silent):
                 _callback=_callback,
                 silent=silent
             )
-
-
-def default_gateway_addresses():
-    default_gw_iface = get_host_gateways()['ipv4']['interface']
-    addresses = []
-    if default_gw_iface:
-        addresses.extend(iface_addresses(default_gw_iface))
-
-    return addresses
-
-
-def iface_addresses(iface_name):
-    addresses = []
-    try:
-        iface = netif.get_interface(iface_name)
-    except KeyError:
-        return addresses
-
-    for addr in filter(lambda i: isinstance(i.address, ipaddress.IPv4Address), iface.addresses):
-        addresses.append({
-            'addr': addr.address.exploded,
-            'broadcast': addr.broadcast.exploded,
-            'carp_ip': bool(addr.vhid),
-        })
-    return addresses
